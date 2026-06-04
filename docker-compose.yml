@@ -15,7 +15,7 @@ services:
     depends_on:
       - db
     environment:
-      DATABASE_URL: postgresql://uy_precios:${DB_PASSWORD}@db:5432/uy_precios
+      DATABASE_URL: postgresql+asyncpg://uy_precios:${DB_PASSWORD}@db:5432/uy_precios
       SCRAPE_SCHEDULE_HOUR: ${SCRAPE_SCHEDULE_HOUR:-9}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
