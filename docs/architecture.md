@@ -14,13 +14,15 @@
 6. [Pipeline de normalización](#6-pipeline-de-normalización)
 7. [Orquestador del pipeline](#7-orquestador-del-pipeline)
 8. [Aplicación FastAPI y scheduling](#8-aplicación-fastapi-y-scheduling)
-9. [Gestión de la base de datos](#9-gestión-de-la-base-de-datos)
-10. [Configuración e infraestructura](#10-configuración-e-infraestructura)
-11. [Estructura del repositorio](#11-estructura-del-repositorio)
-12. [Guía operacional](#12-guía-operacional)
-13. [Cómo agregar un supermercado nuevo](#13-cómo-agregar-un-supermercado-nuevo)
-14. [Testing](#14-testing)
-15. [Limitaciones conocidas y decisiones de diseño](#15-limitaciones-conocidas-y-decisiones-de-diseño)
+9. [Schemas Pydantic](#9-schemas-pydantic)
+10. [Capa API REST](#10-capa-api-rest)
+11. [Gestión de la base de datos](#11-gestión-de-la-base-de-datos)
+12. [Configuración e infraestructura](#12-configuración-e-infraestructura)
+13. [Estructura del repositorio](#13-estructura-del-repositorio)
+14. [Guía operacional](#14-guía-operacional)
+15. [Cómo agregar un supermercado nuevo](#15-cómo-agregar-un-supermercado-nuevo)
+16. [Testing](#16-testing)
+17. [Limitaciones conocidas y decisiones de diseño](#17-limitaciones-conocidas-y-decisiones-de-diseño)
 
 ---
 
@@ -36,7 +38,7 @@ El sistema automatiza ese proceso mediante tres etapas encadenadas:
 
 La arquitectura está diseñada para ser operada con un único comando (`docker compose up`) y para incorporar nuevos supermercados sin modificar el núcleo del sistema.
 
-### Alcance de la implementación actual (Fase 1)
+### Alcance de la implementación actual
 
 | Componente | Estado |
 |---|---|
@@ -48,7 +50,12 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
 | Pipeline de normalización | ✅ Completo |
 | Orquestador del pipeline | ✅ Completo |
 | Scheduler APScheduler | ✅ Completo |
-| Endpoints API REST | 🔄 Pendiente (Fase 2) |
+| Registro de ejecuciones (`scrape_runs`) | ✅ Completo (Fase 2) |
+| Schemas Pydantic (request/response) | ✅ Completo (Fase 2) |
+| Endpoints API REST `/api/v1/products` | ✅ Completo (Fase 2) |
+| Endpoints API REST `/api/v1/supermarkets` | ✅ Completo (Fase 2) |
+| Endpoints de sistema `/health` y `/scrapes` | ✅ Completo (Fase 2) |
+| Tests de API con SQLite en memoria | ✅ Completo (Fase 2) |
 | Frontend React | 🔄 Pendiente (Fase 3) |
 
 ---
@@ -70,30 +77,34 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
 │   │  └──────┬────────┘  │         │   • products             │   │
 │   │         │ diario    │         │   • supermarket_products │   │
 │   │  ┌──────▼────────┐  │  async  │   • price_history        │   │
-│   │  │  run.py       │◀─┼─────────┤                          │   │
+│   │  │  run.py       │◀─┼─────────┤   • scrape_runs          │   │
 │   │  │  (pipeline)   │──┼────────▶│                          │   │
 │   │  └──────┬────────┘  │         └──────────────────────────┘   │
-│   │         │           │                                         │
-│   │  ┌──────▼────────┐  │                                         │
-│   │  │   Scrapers    │  │                                         │
-│   │  │  Playwright   │  │                                         │
-│   │  └───────────────┘  │                                         │
-│   │                     │                                         │
-│   │  ┌───────────────┐  │                                         │
-│   │  │   FastAPI     │  │                                         │
-│   │  │  :8000/docs   │  │                                         │
-│   │  └───────────────┘  │                                         │
+│   │         │           │                        ▲                │
+│   │  ┌──────▼────────┐  │                        │                │
+│   │  │   Scrapers    │  │                        │                │
+│   │  │  Playwright   │  │         ┌──────────────┴───────────┐   │
+│   │  └───────────────┘  │         │        FastAPI            │   │
+│   │                     │         │  GET /api/v1/products     │   │
+│   │  ┌───────────────┐  │         │  GET /api/v1/supermarkets │   │
+│   │  │  FastAPI      │◀─┼─────────│  GET /health             │   │
+│   │  │  :8000/docs   │──┼────────▶│  GET /scrapes            │   │
+│   │  └───────────────┘  │         └──────────────────────────┘   │
 │   └─────────────────────┘                                         │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Flujo de datos
+### Flujo de datos — pipeline de scraping
 
 ```
 [APScheduler 9:00 UTC]
         │
         ▼
 [run_all_scrapers()]
+        │
+        ▼ sesión separada
+[_start_scrape_run()]  → INSERT scrape_runs (status='running') → COMMIT
+        │ scrape_run_id
         │
         ├──────────────────────────────────────┐
         │                                      │
@@ -124,6 +135,28 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
                        │
                        ▼
               [Resumen en stdout]
+                       │
+                       ▼ sesión separada
+[_finish_scrape_run()]  → UPDATE scrape_runs (status='completed'|'failed') → COMMIT
+```
+
+### Flujo de datos — API REST
+
+```
+[HTTP Request]
+      │
+      ▼
+[FastAPI Router]
+      │
+      ├── GET /api/v1/products          → window fn + CTE paginado → ProductSummaryResponse[]
+      ├── GET /api/v1/products/{id}     → ORM + window fn → ProductDetailResponse
+      ├── GET /api/v1/products/{id}/prices   → window fn → CurrentPriceResponse[]
+      ├── GET /api/v1/products/{id}/history  → serie temporal → PriceHistoryResponse
+      ├── GET /api/v1/products/{id}/compare  → prices + cálculo → CompareResponse
+      ├── GET /api/v1/supermarkets           → ORM → SupermarketResponse[]
+      ├── GET /api/v1/supermarkets/{slug}/products → EXISTS + window fn → paginado
+      ├── GET /health                   → SELECT 1 + last ScrapeRun → HealthResponse
+      └── GET /scrapes                  → ORM paginado → ScrapeRunResponse[]
 ```
 
 ### Principios de diseño
@@ -135,6 +168,7 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
 | **Idempotencia del pipeline** | El normalizador solo procesa filas con `product_id IS NULL`; ejecutarlo dos veces es seguro |
 | **Fallo aislado** | Si un scraper lanza una excepción, el otro continúa (via `asyncio.gather(return_exceptions=True)`) |
 | **Extensibilidad por convención** | Agregar un supermercado nuevo = un archivo nuevo que hereda `BaseScraper`; nada más cambia |
+| **Auditoría de ejecuciones** | Cada run del pipeline crea un `ScrapeRun` que persiste aunque el pipeline falle, usando una sesión DB independiente |
 
 ---
 
@@ -153,6 +187,8 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
 | Fuzzy matching | rapidfuzz | latest | Implementación C de algoritmos de distancia de strings; significativamente más rápido que `fuzzywuzzy` |
 | Validación | Pydantic | v2 | Validación de datos y configuración de entorno con `pydantic-settings` |
 | Contenedores | Docker Compose | v2 | Un comando levanta todo el stack; parity entre entornos |
+| Cliente HTTP de tests | httpx | latest | `AsyncClient` + `ASGITransport` para tests de integración sin servidor real |
+| Driver SQLite async | aiosqlite | latest | Backend de tests en memoria; elimina la dependencia de PostgreSQL en el CI |
 
 ---
 
@@ -213,6 +249,17 @@ scraped_at             TIMESTAMPTZ
 date                   DATE NOT NULL
 
 INDEX: idx_price_history_product_date (supermarket_product_id, date DESC)
+
+
+scrape_runs                          ← tabla independiente (no FK a ninguna otra)
+───────────
+id             PK
+started_at     TIMESTAMPTZ DEFAULT NOW()
+finished_at    TIMESTAMPTZ NULL
+status         VARCHAR(20) DEFAULT 'running'   -- 'running' | 'completed' | 'failed'
+scrape_stats   JSON NULL    -- {"tienda_inglesa": {"scraped": N, ...}, "disco": {...}}
+norm_stats     JSON NULL    -- {"processed": N, "matched_auto": N, ...}
+error_message  TEXT NULL
 ```
 
 ### Descripción de tablas
@@ -232,6 +279,10 @@ La representación concreta de un producto tal como existe en un supermercado es
 #### `price_history`
 
 Serie temporal de precios. Es **append-only por diseño**: nunca se modifican ni eliminan registros. Cada ejecución del scraper genera una nueva fila por producto activo. El campo `date` (tipo `DATE`) existe para facilitar queries por día sin parsear timestamps. El índice compuesto `(supermarket_product_id, date DESC)` optimiza las queries más frecuentes: *"dame los precios de este producto en los últimos 30 días"*.
+
+#### `scrape_runs`
+
+Registro de auditoría de cada ejecución del pipeline. Es **independiente de todas las otras tablas** (sin FK salientes): esto es intencional para que un `ScrapeRun` con `status='failed'` pueda persistir aunque la sesión principal del pipeline haya hecho rollback. Los campos `scrape_stats` y `norm_stats` almacenan los contadores de la ejecución como JSON, permitiendo queries de análisis sin parsear logs.
 
 ---
 
@@ -491,11 +542,17 @@ Función pública que orquesta el scrape completo de extremo a extremo. Es llama
 **Fases:**
 
 ```
-1. HEALTH CHECK
+1. REGISTRO DE INICIO (sesión separada)
+   _start_scrape_run()
+   → INSERT scrape_runs (status='running')
+   → COMMIT inmediato con sesión independiente
+   → Retorna scrape_run_id (o None si la DB falla)
+
+2. HEALTH CHECK
    Verifica conectividad a la DB con SELECT 1.
    Si falla → RuntimeError (fallo rápido, no intentar scraping).
 
-2. SCRAPING PARALELO
+3. SCRAPING PARALELO
    asyncio.gather(
        _run_scraper(TiendaInglesaScraper()),
        _run_scraper(DiscoScraper()),
@@ -504,18 +561,33 @@ Función pública que orquesta el scrape completo de extremo a extremo. Es llama
    Si un scraper lanza excepción → se captura como valor de retorno,
    se loguea, y el otro scraper no se ve afectado.
 
-3. PERSISTENCIA
+4. PERSISTENCIA
    Para cada scraper con resultados:
    → _save_scraped_products(session, products, supermarket)
    → session.commit()
 
-4. NORMALIZACIÓN
+5. NORMALIZACIÓN
    → ProductNormalizer().normalize_all(session)
    (incluye su propio session.commit() interno)
 
-5. RESUMEN
+6. RESUMEN
    → _print_summary(save_stats, norm_stats, elapsed)
+
+7. REGISTRO DE FIN (sesión separada)
+   _finish_scrape_run(scrape_run_id, 'completed', save_stats, norm_stats)
+   → UPDATE scrape_runs SET status, finished_at, scrape_stats, norm_stats
+   → COMMIT
+
+   Si ocurre cualquier excepción en fases 2-6:
+   _finish_scrape_run(scrape_run_id, 'failed', error_message=str(exc))
+   → La excepción se re-lanza después del UPDATE
 ```
+
+**Por qué sesiones separadas para `ScrapeRun`:**
+
+Los helpers `_start_scrape_run` y `_finish_scrape_run` abren y cierran su propia `AsyncSession`, independiente de la sesión principal del pipeline. Si la sesión principal hace rollback por un error, el registro de `ScrapeRun` con `status='failed'` persiste igualmente. Sin esta separación, un fallo en el pipeline también revertiría el registro del fallo.
+
+Ambos helpers manejan sus propias excepciones con `try/except` y solo loguean un `WARNING` si la DB está completamente caída, sin propagar el error al caller.
 
 #### `_save_scraped_products(session, scraped, supermarket) → {inserted, updated}`
 
@@ -575,49 +647,228 @@ En el shutdown: `scheduler.shutdown(wait=False)` para no bloquear el cierre.
 
 La importación de `run_all_scrapers` se hace de forma diferida (dentro del `lifespan`) para evitar que el event loop no esté activo en el momento del import a nivel de módulo.
 
-#### Endpoints implementados
+#### Registro de routers
+
+Los dos routers de la API se registran con el prefijo `/api/v1`. Cada router ya define su propio sub-prefijo (`/products` y `/supermarkets`), resultando en rutas como `/api/v1/products`:
+
+```python
+app.include_router(products_router, prefix="/api/v1")
+app.include_router(supermarkets_router, prefix="/api/v1")
+```
+
+#### Endpoints de sistema
 
 **`GET /health`**
 
-Health check básico. Retorna:
-```json
-{"status": "ok"}
-```
+Devuelve el estado operacional del sistema. Requiere DB para funcionar correctamente pero nunca lanza HTTP 500 por errores de DB:
 
-Uso: monitoreo de disponibilidad del servicio.
-
-**`POST /scrapes/trigger`** *(solo desarrollo)*
-
-Dispara el pipeline completo como `BackgroundTask` de FastAPI. No bloquea la respuesta HTTP; el progreso es visible en los logs del servidor.
-
-Respuesta:
 ```json
 {
-  "status": "iniciado",
-  "mensaje": "Scrape en ejecución en background — revisar logs"
+  "status": "ok",
+  "database": "connected",
+  "last_scrape": {
+    "started_at": "2024-11-15T09:00:00Z",
+    "finished_at": "2024-11-15T09:04:32Z",
+    "status": "completed",
+    "total_products_scraped": 1459
+  }
 }
 ```
 
-#### Endpoints planificados (Fase 2)
+`total_products_scraped` se calcula sumando el campo `scraped` de cada entrada en `scrape_stats`. Si no hay ningún `ScrapeRun` en la base de datos, `last_scrape` es `null`. Si la DB está caída, `database` es `"error"` y `last_scrape` es `null`.
 
-Definidos en la spec, pendientes de implementación:
+**`GET /scrapes`**
 
-```
-GET  /api/v1/products                    Lista de productos canónicos (búsqueda, filtros, paginación)
-GET  /api/v1/products/{id}               Detalle de un producto canónico
-GET  /api/v1/products/{id}/prices        Precio actual por supermercado
-GET  /api/v1/products/{id}/history       Historial de precios (para el gráfico)
-GET  /api/v1/products/{id}/compare       Comparación entre supermercados con diferencia %
-GET  /api/v1/supermarkets                Lista de supermercados activos
-GET  /api/v1/supermarkets/{slug}/products Todos los productos de una cadena
-GET  /api/v1/scrapes                     Historial de ejecuciones del scraper
-```
+Historial paginado de ejecuciones del scraper, ordenado por `started_at DESC`. Incluye todos los campos de `ScrapeRun`.
 
-La documentación Swagger interactiva estará disponible en `http://localhost:8000/docs` una vez implementados.
+Parámetros: `page` (default 1), `page_size` (default 10, máximo 50).
+
+**`POST /scrapes/trigger`** *(solo desarrollo)*
+
+Dispara el pipeline completo como `BackgroundTask` de FastAPI. No bloquea la respuesta HTTP.
 
 ---
 
-## 9. Gestión de la base de datos
+## 9. Schemas Pydantic
+
+Los schemas de respuesta de la API residen en `app/schemas/`. Todos los schemas que mapean directamente a un modelo ORM usan `model_config = ConfigDict(from_attributes=True)`.
+
+### `app/schemas/common.py`
+
+#### `PaginatedResponse[T]`
+
+Schema genérico para cualquier respuesta paginada. El campo `pages` se calcula como `ceil(total / page_size)` via `@computed_field` de Pydantic v2:
+
+```python
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    page: int
+    page_size: int
+    pages: int  # computed: ceil(total / page_size)
+```
+
+Usado por `GET /api/v1/products` (con `T = ProductSummaryResponse`) y `GET /scrapes` (con `T = ScrapeRunResponse`).
+
+### `app/schemas/supermarket.py`
+
+#### `SupermarketResponse`
+
+Representación de un supermercado en respuestas de API:
+
+```python
+class SupermarketResponse(BaseModel):
+    id: int
+    slug: str
+    name: str
+    base_url: str
+```
+
+### `app/schemas/product.py`
+
+Los ocho schemas del recurso de productos, en orden de dependencia:
+
+| Schema | Usado en | Descripción |
+|---|---|---|
+| `CurrentPriceResponse` | `/products`, `/prices`, `/compare` | Precio actual de un producto en un supermercado: slug, name, price, currency, date, url, image_url |
+| `ProductSummaryResponse` | `/products`, `/compare` | Para el listado: id, name, category, brand, unit + lista de `CurrentPriceResponse` + `min_price` |
+| `SupermarketProductDetailResponse` | `/products/{id}` | Un `supermarket_product` con su precio actual (puede ser `None` si no hay historial) |
+| `ProductDetailResponse` | `/products/{id}` | Producto canónico completo con timestamps y lista de `SupermarketProductDetailResponse` |
+| `PricePointResponse` | `/history` | Un punto en una serie temporal: date + price |
+| `PriceHistoryResponse` | `/history` | Diccionario `{slug: list[PricePointResponse]}` para alimentar Recharts |
+| `CompareEntryResponse` | `/compare` | Una fila de la tabla de comparación (similar a `CurrentPriceResponse` sin `image_url`) |
+| `CompareResponse` | `/compare` | Respuesta completa: product + comparison + cheapest + difference + difference_pct |
+
+### `app/schemas/system.py`
+
+| Schema | Usado en | Descripción |
+|---|---|---|
+| `LastScrapeResponse` | `/health` | Resumen del último scrape: started_at, finished_at, status, total_products_scraped |
+| `HealthResponse` | `/health` | status + database + last_scrape |
+| `ScrapeRunResponse` | `/scrapes` | Todos los campos de `ScrapeRun`, mapeado desde ORM con `from_attributes=True` |
+
+---
+
+## 10. Capa API REST
+
+### Estructura de routers
+
+```
+app/routers/
+├── __init__.py          # vacío
+├── products.py          # APIRouter(prefix="/products")
+└── supermarkets.py      # APIRouter(prefix="/supermarkets")
+```
+
+Los routers se registran en `main.py` con `app.include_router(..., prefix="/api/v1")`, resultando en rutas finales de la forma `/api/v1/products/...`.
+
+### Estrategia de queries SQL
+
+Los endpoints de productos y supermercados requieren obtener el **precio más reciente** de cada `supermarket_product`. Existen dos enfoques SQL para esto:
+
+**LATERAL JOIN** (PostgreSQL-only):
+```sql
+JOIN LATERAL (
+    SELECT price, currency, date FROM price_history
+    WHERE supermarket_product_id = sp.id
+    ORDER BY date DESC, scraped_at DESC LIMIT 1
+) ph ON true
+```
+
+**Window function con ROW_NUMBER** (portátil: PostgreSQL + SQLite):
+```sql
+JOIN (
+    SELECT supermarket_product_id, price, currency, date,
+           ROW_NUMBER() OVER (
+               PARTITION BY supermarket_product_id
+               ORDER BY date DESC, scraped_at DESC
+           ) AS _rn
+    FROM price_history
+) ph ON ph.supermarket_product_id = sp.id AND ph._rn = 1
+```
+
+El sistema usa la segunda variante porque permite ejecutar los tests contra SQLite en memoria sin necesitar PostgreSQL. Para datasets reales (orden de millones de filas en `price_history`), ambas variantes son equivalentes desde el punto de vista del query planner de PostgreSQL dado que el índice `idx_price_history_product_date` es usado en ambos casos.
+
+De forma similar, los filtros de texto usan `lower(p.name) LIKE lower(:q_pattern)` en lugar de `ILIKE` por la misma razón de portabilidad.
+
+### Router de productos — `app/routers/products.py`
+
+#### `GET /api/v1/products`
+
+**Parámetros:** `q`, `category`, `supermarket`, `page`, `page_size` (máx. 100)
+
+**Respuesta:** `PaginatedResponse[ProductSummaryResponse]`
+
+El query usa un CTE con dos partes:
+1. `paginated_ids`: selecciona `DISTINCT p.id` con los filtros, paginado
+2. Query principal: re-join completo sobre los IDs del CTE para obtener todos los campos
+
+Esto resuelve el problema de paginación con joins (sin el CTE, un `LIMIT` sobre filas denormalizadas produciría resultados incorrectos).
+
+El campo `current_prices` de cada `ProductSummaryResponse` incluye el precio de **todos** los supermercados donde el producto tiene historial. El campo `min_price` se calcula en Python iterando sobre `current_prices`.
+
+#### `GET /api/v1/products/{id}`
+
+**Respuesta:** `ProductDetailResponse` | 404
+
+Fetch del `Product` via ORM + query SQL separado para los `supermarket_products` con su último precio (usando `LEFT JOIN` con window function, para incluir también los que no tienen historial con precio `null`).
+
+#### `GET /api/v1/products/{id}/prices`
+
+**Respuesta:** `list[CurrentPriceResponse]` | 404
+
+Similar al listado de precios de `/products`, pero filtrado a un producto específico y ordenado por `price ASC`. Solo incluye supermercados con al menos un registro en `price_history` (usa `JOIN`, no `LEFT JOIN`).
+
+#### `GET /api/v1/products/{id}/history`
+
+**Parámetros:** `from` (alias de `from_date`), `to` (alias de `to_date`)
+
+**Respuesta:** `PriceHistoryResponse` | 404
+
+Los parámetros `from` y `to` son keywords de Python, por lo que se declaran con `Query(alias="from")` y `Query(alias="to")` para mantener la URL limpia.
+
+El resultado es un diccionario `{slug: [PricePointResponse]}` ya ordenado por `date ASC`, listo para consumir directamente por Recharts sin procesamiento adicional en el frontend.
+
+#### `GET /api/v1/products/{id}/compare`
+
+**Respuesta:** `CompareResponse` | 404
+
+Reutiliza el helper interno `_fetch_current_prices()` que ya devuelve los precios ordenados por `price ASC`. Con ese orden garantizado:
+- `cheapest` = `current_prices[0].supermarket_slug`
+- `min_price` = `current_prices[0].price`
+- `max_price` = `current_prices[-1].price`
+- `difference` = `round(max_price - min_price, 2)`
+- `difference_pct` = `round(float(difference / min_price) * 100, 2)`
+
+Si solo hay un supermercado: `difference=0`, `difference_pct=0.0`. Si no hay ninguno: todos `None`.
+
+**Helpers privados:**
+
+Los helpers `_get_product_or_404` y `_fetch_current_prices` no están decorados con `@router.get`, por lo que FastAPI no los registra como endpoints pero están disponibles para cualquier handler del módulo.
+
+### Router de supermercados — `app/routers/supermarkets.py`
+
+#### `GET /api/v1/supermarkets`
+
+**Respuesta:** `list[SupermarketResponse]`
+
+Query ORM simple: `SELECT ... WHERE active = true ORDER BY name ASC`. Usa `model_validate()` para construir los schemas desde los objetos ORM.
+
+#### `GET /api/v1/supermarkets/{slug}/products`
+
+**Parámetros:** `page`, `page_size` (máx. 100)
+
+**Respuesta:** `SupermarketProductsResponse` | 404
+
+`SupermarketProductsResponse` es un schema inline definido en el router (no en `app/schemas/`) porque combina el campo `supermarket: SupermarketResponse` con los campos de paginación, lo cual no encaja en el `PaginatedResponse[T]` genérico.
+
+A diferencia de `GET /products`, aquí `current_prices` de cada `ProductSummaryResponse` contiene **exactamente una entrada**: el precio de este supermercado. La intención es comparar precios entre cadenas en la vista de producto (`/compare`), no en el listado de cadena.
+
+El check de "tiene al menos un precio" usa `WHERE EXISTS (SELECT 1 FROM price_history WHERE supermarket_product_id = sp.id)` en lugar de un JOIN, lo cual es semánticamente más claro para el caso de existencia.
+
+---
+
+## 11. Gestión de la base de datos
 
 ### Configuración — `app/db/session.py`
 
@@ -663,6 +914,24 @@ class SupermarketProduct(Base):
 | `models/product.py` | `Product` | `products` |
 | `models/supermarket_product.py` | `SupermarketProduct` | `supermarket_products` |
 | `models/price_history.py` | `PriceHistory` | `price_history` |
+| `models/scrape_run.py` | `ScrapeRun` | `scrape_runs` |
+
+#### `ScrapeRun` — `app/models/scrape_run.py`
+
+```python
+class ScrapeRun(Base):
+    __tablename__ = "scrape_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), server_default="'running'")
+    scrape_stats: Mapped[dict | None] = mapped_column(JSON)
+    norm_stats: Mapped[dict | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+```
+
+No tiene relaciones con otras tablas por diseño (ver sección 4).
 
 ### Migraciones — Alembic
 
@@ -688,14 +957,34 @@ El `target_metadata = Base.metadata` importado de todos los modelos habilita la 
 Crea las 4 tablas en orden de dependencias de FK:
 `supermarkets` → `products` → `supermarket_products` → `price_history`
 
-Los dos índices de performance se crean al final:
-- `idx_supermarket_products_product` — para queries por `product_id` (carga del normalizador)
-- `idx_price_history_product_date` — con `date DESC` para queries de historial
+**Migración Fase 2 (`b3c4d5e6f701_add_scrape_runs.py`):**
+
+Agrega la tabla `scrape_runs`. Al no tener dependencias de FK con otras tablas, no requiere un orden específico de ejecución:
+
+```python
+down_revision = "a1b2c3d4e5f0"
+
+def upgrade() -> None:
+    op.create_table(
+        "scrape_runs",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("status", sa.String(20), server_default="'running'", nullable=False),
+        sa.Column("scrape_stats", sa.JSON(), nullable=True),
+        sa.Column("norm_stats", sa.JSON(), nullable=True),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+    )
+
+def downgrade() -> None:
+    op.drop_table("scrape_runs")
+```
 
 **Comandos operacionales:**
 
 ```bash
-# Aplicar migraciones pendientes
+# Aplicar todas las migraciones pendientes
 docker compose exec backend alembic upgrade head
 
 # Crear nueva migración (después de modificar modelos)
@@ -718,7 +1007,7 @@ docker compose exec backend python -m app.db.seed
 
 ---
 
-## 10. Configuración e infraestructura
+## 12. Configuración e infraestructura
 
 ### Variables de entorno
 
@@ -776,7 +1065,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload
 
 ---
 
-## 11. Estructura del repositorio
+## 13. Estructura del repositorio
 
 ```
 uy-precios/
@@ -791,33 +1080,45 @@ uy-precios/
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
+│   ├── pytest.ini              # asyncio_mode = auto para pytest-asyncio
 │   ├── alembic.ini             # Configuración de Alembic
 │   │
 │   ├── alembic/
 │   │   ├── env.py              # Entorno async de Alembic
 │   │   ├── script.py.mako      # Template para nuevas migraciones
 │   │   └── versions/
-│   │       └── a1b2c3d4e5f0_initial_schema.py
+│   │       ├── a1b2c3d4e5f0_initial_schema.py    # Fase 1: tablas base
+│   │       └── b3c4d5e6f701_add_scrape_runs.py   # Fase 2: tabla scrape_runs
 │   │
 │   ├── app/
-│   │   ├── main.py             # FastAPI app + scheduler APScheduler
+│   │   ├── main.py             # FastAPI app + scheduler + endpoints de sistema
 │   │   │
 │   │   ├── core/
 │   │   │   └── config.py       # Configuración via pydantic-settings
 │   │   │
 │   │   ├── db/
-│   │   │   ├── session.py      # Engine async + AsyncSessionLocal
+│   │   │   ├── session.py      # Engine async + AsyncSessionLocal + get_db()
 │   │   │   └── seed.py         # Inserción inicial de supermercados
 │   │   │
 │   │   ├── models/
-│   │   │   ├── base.py             # DeclarativeBase
-│   │   │   ├── supermarket.py      # Modelo Supermarket
-│   │   │   ├── product.py          # Modelo Product (canónico)
-│   │   │   ├── supermarket_product.py
-│   │   │   └── price_history.py    # Modelo PriceHistory (append-only)
+│   │   │   ├── base.py                    # DeclarativeBase
+│   │   │   ├── supermarket.py             # Modelo Supermarket
+│   │   │   ├── product.py                 # Modelo Product (canónico)
+│   │   │   ├── supermarket_product.py     # Modelo SupermarketProduct
+│   │   │   ├── price_history.py           # Modelo PriceHistory (append-only)
+│   │   │   └── scrape_run.py              # Modelo ScrapeRun (auditoría)
 │   │   │
-│   │   ├── routers/            # Endpoints FastAPI (Fase 2)
-│   │   ├── schemas/            # Pydantic schemas (Fase 2)
+│   │   ├── schemas/
+│   │   │   ├── __init__.py
+│   │   │   ├── common.py       # PaginatedResponse[T] genérico
+│   │   │   ├── product.py      # 8 schemas del recurso /products
+│   │   │   ├── supermarket.py  # SupermarketResponse
+│   │   │   └── system.py       # HealthResponse, ScrapeRunResponse, LastScrapeResponse
+│   │   │
+│   │   ├── routers/
+│   │   │   ├── __init__.py
+│   │   │   ├── products.py     # 5 endpoints: list, detail, prices, history, compare
+│   │   │   └── supermarkets.py # 2 endpoints: list, products-by-supermarket
 │   │   │
 │   │   ├── services/
 │   │   │   └── normalizer.py   # Pipeline de normalización con rapidfuzz
@@ -829,15 +1130,16 @@ uy-precios/
 │   │       └── run.py              # Orquestador del pipeline completo
 │   │
 │   └── tests/
-│       ├── conftest.py             # Fixtures y variables de entorno de test
-│       └── test_normalizer.py      # Tests del pipeline de normalización
+│       ├── conftest.py             # Fixtures SQLite + override get_db()
+│       ├── test_normalizer.py      # Tests del pipeline de normalización
+│       └── test_api.py             # Tests de integración de la API REST
 │
 └── frontend/                   # Pendiente (Fase 3)
 ```
 
 ---
 
-## 12. Guía operacional
+## 14. Guía operacional
 
 ### Primer arranque
 
@@ -867,6 +1169,37 @@ docker compose exec backend python -m app.scrapers.run
 
 # Opción B: endpoint HTTP (proceso en background)
 curl -X POST http://localhost:8000/scrapes/trigger
+```
+
+### Consumir la API
+
+```bash
+# Documentación interactiva Swagger
+open http://localhost:8000/docs
+
+# Buscar productos
+curl "http://localhost:8000/api/v1/products?q=leche&page=1&page_size=5" | jq
+
+# Detalle de un producto canónico
+curl "http://localhost:8000/api/v1/products/42" | jq
+
+# Precios actuales por supermercado
+curl "http://localhost:8000/api/v1/products/42/prices" | jq
+
+# Historial de precios para gráfico (últimos 30 días)
+curl "http://localhost:8000/api/v1/products/42/history?from=2024-10-15&to=2024-11-15" | jq
+
+# Comparación entre supermercados
+curl "http://localhost:8000/api/v1/products/42/compare" | jq
+
+# Supermercados activos
+curl "http://localhost:8000/api/v1/supermarkets" | jq
+
+# Productos de Tienda Inglesa (página 2)
+curl "http://localhost:8000/api/v1/supermarkets/tienda_inglesa/products?page=2" | jq
+
+# Historial de scrapes
+curl "http://localhost:8000/scrapes?page=1&page_size=5" | jq
 ```
 
 ### Probar un scraper individual
@@ -904,11 +1237,18 @@ JOIN supermarket_products sp ON ph.supermarket_product_id = sp.id
 JOIN supermarkets s ON sp.supermarket_id = s.id
 WHERE sp.product_id = 42
 ORDER BY ph.date DESC;
+
+-- Historial de ejecuciones del scraper
+SELECT id, status, started_at, finished_at,
+       scrape_stats->>'tienda_inglesa' AS ti_stats
+FROM scrape_runs
+ORDER BY started_at DESC
+LIMIT 10;
 ```
 
 ---
 
-## 13. Cómo agregar un supermercado nuevo
+## 15. Cómo agregar un supermercado nuevo
 
 La arquitectura de scrapers está diseñada para que esta operación no requiera modificar ningún archivo existente.
 
@@ -970,11 +1310,41 @@ La normalización, la API y el frontend funcionan automáticamente con el nuevo 
 
 ---
 
-## 14. Testing
+## 16. Testing
 
 ### Estructura
 
-Los tests residen en `backend/tests/`. `conftest.py` establece la variable `DATABASE_URL` a un valor dummy para que los módulos que importan `pydantic-settings` puedan cargarse sin una base de datos real.
+```
+backend/tests/
+├── conftest.py          # Fixtures compartidas: SQLite engine, sesión, cliente HTTP
+├── test_normalizer.py   # Tests del pipeline de normalización (Fase 1)
+└── test_api.py          # Tests de integración de la API REST (Fase 2)
+```
+
+`pytest.ini` en la raíz de `backend/` configura `asyncio_mode = auto`, lo que permite escribir tests async sin decorar cada función con `@pytest.mark.asyncio`.
+
+### Infraestructura de tests — `conftest.py`
+
+Los tests de API usan tres fixtures encadenadas:
+
+```
+db_engine  →  db_session  →  (datos de test)
+     └──────────────────────→  client
+```
+
+**`db_engine`** — Crea un engine SQLite en memoria y construye el schema completo desde `Base.metadata`. Al finalizar el test, elimina todas las tablas y cierra el engine.
+
+**`db_session`** — Abre una `AsyncSession` conectada al engine de test. Cada test recibe una sesión limpia (la fixture `db_engine` recrea el schema para cada test).
+
+**`client`** — Crea un `httpx.AsyncClient` con `ASGITransport(app=app)` y sobreescribe la dependency `get_db()` con una función que devuelve sesiones del engine de test. Limpia `app.dependency_overrides` al finalizar.
+
+```python
+async def override_get_db():
+    async with factory() as session:
+        yield session
+
+app.dependency_overrides[get_db] = override_get_db
+```
 
 ### `test_normalizer.py`
 
@@ -1003,14 +1373,33 @@ Tests unitarios y de integración del pipeline de normalización.
 |---|---|
 | `test_nuevo_canonico_creado_cuando_no_hay_match` | Flujo completo del pipeline con `AsyncMock`: producto sin match crea canónico, lo asigna, y hace exactamente un `commit` |
 
+### `test_api.py`
+
+Tests de integración de la API REST. Cada test inserta sus propios datos directamente con `AsyncSession` (sin mocks de ORM), lo que verifica que los queries SQL reales funcionan correctamente.
+
+| Test | Endpoint | Cobertura |
+|---|---|---|
+| `test_health_sin_scrapes` | `GET /health` | Devuelve `status='ok'` y `last_scrape=null` con tabla `scrape_runs` vacía |
+| `test_health_con_scrape` | `GET /health` | Refleja el último `ScrapeRun` y calcula `total_products_scraped` correctamente |
+| `test_products_lista_vacia` | `GET /api/v1/products` | Devuelve `items=[]` y `total=0` sin productos en DB |
+| `test_products_busqueda_por_nombre` | `GET /api/v1/products?q=leche` | Filtra correctamente con dos productos en DB (uno con "leche", uno sin) |
+| `test_product_not_found` | `GET /api/v1/products/99999` | Devuelve HTTP 404 |
+| `test_compare_un_solo_supermercado` | `GET /api/v1/products/{id}/compare` | Con un solo supermercado: `difference=0`, `difference_pct=0.0` |
+| `test_supermarkets_lista` | `GET /api/v1/supermarkets` | Devuelve solo supermercados con `active=True` |
+
 ### Ejecutar los tests
 
 ```bash
 cd backend
+
+# Todos los tests
 pytest tests/ -v
 
-# Solo tests síncronos (más rápidos)
-pytest tests/ -v -k "not asyncio"
+# Solo tests de API
+pytest tests/test_api.py -v
+
+# Solo tests del normalizador
+pytest tests/test_normalizer.py -v
 
 # Con cobertura
 pytest tests/ --cov=app --cov-report=term-missing
@@ -1018,7 +1407,7 @@ pytest tests/ --cov=app --cov-report=term-missing
 
 ---
 
-## 15. Limitaciones conocidas y decisiones de diseño
+## 17. Limitaciones conocidas y decisiones de diseño
 
 ### Tabla de decisiones
 
@@ -1031,6 +1420,9 @@ pytest tests/ --cov=app --cov-report=term-missing
 | Scrape parcial aceptado | Los productos disponibles se guardan aunque la sesión no complete | Un dato parcial es mejor que ningún dato; el sistema de historial permite detectar productos que dejaron de aparecer |
 | `external_id` puede ser `NULL` | Fallback de deduplicación por `name_raw` | No todos los sitios exponen un ID de producto en el DOM; la garantía de deduplicación es más débil pero funcional |
 | `category`, `brand`, `unit` en `products` son `NULL` en v1 | Se crean canónicos solo con `name`; los campos se enriquecen en fases posteriores | El NLP para inferir marca y unidad desde el nombre es un enhancement, no un bloqueante para la comparación de precios |
+| Tests de API requieren SQL portátil | Window functions + `lower() LIKE lower()` en lugar de `LATERAL JOIN` + `ILIKE` | Permite usar SQLite en memoria como DB de tests sin necesitar PostgreSQL; ambas variantes son semánticamente equivalentes y el query planner de PostgreSQL usa los mismos índices |
+| `ScrapeRun` sin FK a otras tablas | Tabla de auditoría totalmente independiente | Si la sesión principal del pipeline falla con rollback, el registro de `status='failed'` debe persistir igualmente; las FK al resto del schema crearían acoplamiento que rompería este invariante |
+| `GET /supermarkets/{slug}/products` muestra solo el precio de esa cadena | Un `CurrentPriceResponse` por producto (no todos los supermercados) | El endpoint responde la pregunta "¿cuánto cuestan los productos en esta cadena?", no "¿dónde está más barato este producto?". Esa segunda pregunta la responde `/compare` |
 
 ### Nota sobre los selectores CSS de los scrapers
 
