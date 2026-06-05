@@ -4,6 +4,7 @@ import { getProduct, getProductCompare, type CompareResponse, type ProductDetail
 import ErrorMessage from '../components/ErrorMessage'
 import LoadingSpinner from '../components/LoadingSpinner'
 import PriceCompareTable from '../components/PriceCompareTable'
+import PriceHistoryChart from '../components/PriceHistoryChart'
 import { formatDate } from '../utils/formatters'
 
 export default function ProductDetailPage() {
@@ -124,6 +125,12 @@ export default function ProductDetailPage() {
             Última actualización: {formatDate(lastUpdated)}
           </p>
         )}
+      </section>
+
+      {/* Historial de precios */}
+      <section>
+        <h2 className="text-lg font-semibold text-gray-800 mb-3">Historial de precios</h2>
+        <PriceHistoryChart productId={numericId} />
       </section>
 
       {/* Nombre en cada supermercado */}

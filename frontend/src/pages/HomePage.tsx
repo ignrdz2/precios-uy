@@ -88,48 +88,53 @@ export default function HomePage() {
 
   return (
     <div className="flex flex-col gap-6 sm:flex-row sm:gap-8">
-      {/* Sidebar de filtros */}
+      {/* Sidebar de filtros — collapsible en mobile, siempre visible en desktop */}
       <aside className="w-full sm:w-64 sm:flex-shrink-0">
-        <h2 className="font-bold text-gray-800 mb-3">Filtros</h2>
-        <div className="flex flex-col gap-3">
-          <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1" htmlFor="filter-category">
-              Categoría
-            </label>
-            <select
-              id="filter-category"
-              value={category}
-              onChange={(e) => setCategory(e.target.value)}
-              className="w-full rounded-md border border-gray-300 bg-white py-1.5 px-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="">Todas las categorías</option>
-              {categories.map((cat) => (
-                <option key={cat} value={cat}>
-                  {cat}
-                </option>
-              ))}
-            </select>
-          </div>
+        <details className="group">
+          <summary className="sm:hidden list-none cursor-pointer font-bold text-gray-800 flex items-center justify-between py-2 border-b border-gray-100 mb-3">
+            Filtros ▼
+          </summary>
+          <h2 className="hidden sm:block font-bold text-gray-800 mb-3">Filtros</h2>
+          <div className="hidden group-open:flex sm:flex flex-col gap-3 mt-3 sm:mt-0">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1" htmlFor="filter-category">
+                Categoría
+              </label>
+              <select
+                id="filter-category"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="w-full rounded-md border border-gray-300 bg-white py-1.5 px-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              >
+                <option value="">Todas las categorías</option>
+                {categories.map((cat) => (
+                  <option key={cat} value={cat}>
+                    {cat}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-          <div>
-            <label className="block text-xs font-medium text-gray-500 mb-1" htmlFor="filter-supermarket">
-              Supermercado
-            </label>
-            <select
-              id="filter-supermarket"
-              value={supermarket}
-              onChange={(e) => setSupermarket(e.target.value)}
-              className="w-full rounded-md border border-gray-300 bg-white py-1.5 px-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="">Todos los supermercados</option>
-              {supermarkets.map((sm) => (
-                <option key={sm.slug} value={sm.slug}>
-                  {sm.name}
-                </option>
-              ))}
-            </select>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1" htmlFor="filter-supermarket">
+                Supermercado
+              </label>
+              <select
+                id="filter-supermarket"
+                value={supermarket}
+                onChange={(e) => setSupermarket(e.target.value)}
+                className="w-full rounded-md border border-gray-300 bg-white py-1.5 px-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              >
+                <option value="">Todos los supermercados</option>
+                {supermarkets.map((sm) => (
+                  <option key={sm.slug} value={sm.slug}>
+                    {sm.name}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
-        </div>
+        </details>
       </aside>
 
       {/* Contenido principal */}
@@ -176,7 +181,7 @@ export default function HomePage() {
             >
               ← Anterior
             </button>
-            <span className="text-sm text-gray-600">
+            <span className="hidden sm:inline text-sm text-gray-600">
               Página {page} de {result.pages}
             </span>
             <button
