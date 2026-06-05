@@ -13,13 +13,14 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import date
+from datetime import UTC, date, datetime
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import AsyncSessionLocal
 from app.models.price_history import PriceHistory
+from app.models.scrape_run import ScrapeRun
 from app.models.supermarket import Supermarket
 from app.models.supermarket_product import SupermarketProduct
 from app.scrapers.base import BaseScraper, ScrapedProduct
@@ -40,65 +41,123 @@ async def run_all_scrapers() -> None:
     start = time.monotonic()
     logger.info("=== Iniciando scrape completo ===")
 
-    # Verificar conectividad a DB antes de hacer cualquier trabajo costoso
+    scrape_run_id = await _start_scrape_run()
+
     try:
-        async with AsyncSessionLocal() as probe:
-            await probe.execute(text("SELECT 1"))
-    except Exception as exc:
-        logger.error("Base de datos no disponible: %s", exc)
-        raise RuntimeError(f"No se puede conectar a la base de datos: {exc}") from exc
+        # Verificar conectividad a DB antes de hacer cualquier trabajo costoso
+        try:
+            async with AsyncSessionLocal() as probe:
+                await probe.execute(text("SELECT 1"))
+        except Exception as exc:
+            logger.error("Base de datos no disponible: %s", exc)
+            raise RuntimeError(f"No se puede conectar a la base de datos: {exc}") from exc
 
-    # Correr ambos scrapers en paralelo; return_exceptions=True evita cancelar
-    # el otro scraper si uno falla
-    scrape_results = await asyncio.gather(
-        _run_scraper(TiendaInglesaScraper()),
-        _run_scraper(DiscoScraper()),
-        return_exceptions=True,
-    )
+        # Correr ambos scrapers en paralelo; return_exceptions=True evita cancelar
+        # el otro scraper si uno falla
+        scrape_results = await asyncio.gather(
+            _run_scraper(TiendaInglesaScraper()),
+            _run_scraper(DiscoScraper()),
+            return_exceptions=True,
+        )
 
-    slugs = ["tienda_inglesa", "disco"]
-    scrapers_data: dict[str, list[ScrapedProduct] | BaseException] = dict(
-        zip(slugs, scrape_results)
-    )
+        slugs = ["tienda_inglesa", "disco"]
+        scrapers_data: dict[str, list[ScrapedProduct] | BaseException] = dict(
+            zip(slugs, scrape_results)
+        )
 
-    # Guardar en DB y normalizar dentro de una sola sesión
-    async with AsyncSessionLocal() as session:
-        supermarkets = await _load_supermarkets(session)
-        save_stats: dict[str, dict] = {}
+        # Guardar en DB y normalizar dentro de una sola sesión
+        async with AsyncSessionLocal() as session:
+            supermarkets = await _load_supermarkets(session)
+            save_stats: dict[str, dict] = {}
 
-        for slug, result in scrapers_data.items():
-            if isinstance(result, BaseException):
-                logger.error("[%s] scraper falló con excepción: %s", slug, result)
-                save_stats[slug] = {"scraped": 0, "inserted": 0, "updated": 0, "error": True}
-                continue
+            for slug, result in scrapers_data.items():
+                if isinstance(result, BaseException):
+                    logger.error("[%s] scraper falló con excepción: %s", slug, result)
+                    save_stats[slug] = {"scraped": 0, "inserted": 0, "updated": 0, "error": True}
+                    continue
 
-            supermarket = supermarkets.get(slug)
-            if not supermarket:
-                logger.error(
-                    "[%s] supermercado no encontrado en DB — ¿ejecutaste seed.py?", slug
+                supermarket = supermarkets.get(slug)
+                if not supermarket:
+                    logger.error(
+                        "[%s] supermercado no encontrado en DB — ¿ejecutaste seed.py?", slug
+                    )
+                    save_stats[slug] = {"scraped": 0, "inserted": 0, "updated": 0, "error": True}
+                    continue
+
+                stats = await _save_scraped_products(session, result, supermarket)
+                stats["scraped"] = len(result)
+                save_stats[slug] = stats
+                logger.info(
+                    "[%s] guardados %d productos (nuevos=%d actualizados=%d)",
+                    slug,
+                    len(result),
+                    stats["inserted"],
+                    stats["updated"],
                 )
-                save_stats[slug] = {"scraped": 0, "inserted": 0, "updated": 0, "error": True}
-                continue
 
-            stats = await _save_scraped_products(session, result, supermarket)
-            stats["scraped"] = len(result)
-            save_stats[slug] = stats
-            logger.info(
-                "[%s] guardados %d productos (nuevos=%d actualizados=%d)",
-                slug,
-                len(result),
-                stats["inserted"],
-                stats["updated"],
-            )
+            # Commit de todos los upserts antes de normalizar
+            await session.commit()
 
-        # Commit de todos los upserts antes de normalizar
-        await session.commit()
+            # Normalizar — solo procesa filas con product_id IS NULL
+            norm_stats = await ProductNormalizer().normalize_all(session)
 
-        # Normalizar — solo procesa filas con product_id IS NULL
-        norm_stats = await ProductNormalizer().normalize_all(session)
+        elapsed = time.monotonic() - start
+        _print_summary(save_stats, norm_stats, elapsed)
 
-    elapsed = time.monotonic() - start
-    _print_summary(save_stats, norm_stats, elapsed)
+        await _finish_scrape_run(
+            scrape_run_id, "completed", scrape_stats=save_stats, norm_stats=norm_stats
+        )
+
+    except Exception as exc:
+        await _finish_scrape_run(scrape_run_id, "failed", error_message=str(exc))
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Helpers de registro de ejecución (sesión independiente de la sesión principal)
+# ---------------------------------------------------------------------------
+
+
+async def _start_scrape_run() -> int | None:
+    """Inserta un ScrapeRun con status='running' y devuelve su id."""
+    try:
+        async with AsyncSessionLocal() as session:
+            run = ScrapeRun()
+            session.add(run)
+            await session.commit()
+            await session.refresh(run)
+            return run.id
+    except Exception as exc:
+        logger.warning("No se pudo registrar inicio de scrape: %s", exc)
+        return None
+
+
+async def _finish_scrape_run(
+    scrape_run_id: int | None,
+    status: str,
+    scrape_stats: dict | None = None,
+    norm_stats: dict | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Actualiza el ScrapeRun con el resultado final de la ejecución."""
+    if scrape_run_id is None:
+        return
+    try:
+        async with AsyncSessionLocal() as session:
+            run = await session.get(ScrapeRun, scrape_run_id)
+            if run is None:
+                return
+            run.status = status
+            run.finished_at = datetime.now(UTC)
+            if scrape_stats is not None:
+                run.scrape_stats = scrape_stats
+            if norm_stats is not None:
+                run.norm_stats = norm_stats
+            if error_message is not None:
+                run.error_message = error_message
+            await session.commit()
+    except Exception as exc:
+        logger.warning("No se pudo actualizar ScrapeRun %d: %s", scrape_run_id, exc)
 
 
 # ---------------------------------------------------------------------------
