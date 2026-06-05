@@ -25,22 +25,26 @@ router = APIRouter(prefix="/products", tags=["products"])
 # SQL reutilizable
 # ---------------------------------------------------------------------------
 
-# Filtros comunes a COUNT y al CTE de paginación
+# Subquery de ventana para obtener el precio más reciente por supermarket_product.
+# Usa ROW_NUMBER() OVER (...) en lugar de LATERAL para compatibilidad con SQLite
+# (tests) y PostgreSQL (producción).
+_LAST_PRICE_INNER = """(
+    SELECT supermarket_product_id, price, currency, date,
+           ROW_NUMBER() OVER (
+               PARTITION BY supermarket_product_id
+               ORDER BY date DESC, scraped_at DESC
+           ) AS _rn
+    FROM price_history
+) ph"""
+
+_JOIN_LAST_PRICE = f"JOIN {_LAST_PRICE_INNER} ON ph.supermarket_product_id = sp.id AND ph._rn = 1"
+_LEFT_JOIN_LAST_PRICE = f"LEFT JOIN {_LAST_PRICE_INNER} ON ph.supermarket_product_id = sp.id AND ph._rn = 1"
+
+# lower() LIKE lower() en lugar de ILIKE para compatibilidad con SQLite
 _WHERE_FILTERS = """
-    (:q IS NULL OR p.name ILIKE :q_pattern)
+    (:q IS NULL OR lower(p.name) LIKE lower(:q_pattern))
     AND (:category IS NULL OR p.category = :category)
     AND (:supermarket IS NULL OR sm.slug = :supermarket)
-"""
-
-# Obtiene el último precio de un supermarket_product vía LATERAL
-_LATERAL_LAST_PRICE = """
-    JOIN LATERAL (
-        SELECT price, currency, date
-        FROM price_history
-        WHERE supermarket_product_id = sp.id
-        ORDER BY date DESC, scraped_at DESC
-        LIMIT 1
-    ) ph ON true
 """
 
 _COUNT_SQL = text(f"""
@@ -48,7 +52,7 @@ _COUNT_SQL = text(f"""
     FROM products p
     JOIN supermarket_products sp ON sp.product_id = p.id AND sp.active = true
     JOIN supermarkets sm ON sm.id = sp.supermarket_id AND sm.active = true
-    {_LATERAL_LAST_PRICE}
+    {_JOIN_LAST_PRICE}
     WHERE {_WHERE_FILTERS}
 """)
 
@@ -58,7 +62,7 @@ _LIST_SQL = text(f"""
         FROM products p
         JOIN supermarket_products sp ON sp.product_id = p.id AND sp.active = true
         JOIN supermarkets sm ON sm.id = sp.supermarket_id AND sm.active = true
-        {_LATERAL_LAST_PRICE}
+        {_JOIN_LAST_PRICE}
         WHERE {_WHERE_FILTERS}
         ORDER BY p.id
         LIMIT :page_size OFFSET :offset
@@ -80,11 +84,11 @@ _LIST_SQL = text(f"""
     JOIN products p             ON p.id = pi.id
     JOIN supermarket_products sp ON sp.product_id = p.id AND sp.active = true
     JOIN supermarkets sm        ON sm.id = sp.supermarket_id AND sm.active = true
-    {_LATERAL_LAST_PRICE}
+    {_JOIN_LAST_PRICE}
     ORDER BY p.id, sm.slug
 """)
 
-_DETAIL_SPS_SQL = text("""
+_DETAIL_SPS_SQL = text(f"""
     SELECT
         sp.id,
         sp.name_raw,
@@ -97,20 +101,14 @@ _DETAIL_SPS_SQL = text("""
         ph.date     AS last_updated
     FROM supermarket_products sp
     JOIN supermarkets sm ON sm.id = sp.supermarket_id
-    LEFT JOIN LATERAL (
-        SELECT price, currency, date
-        FROM price_history
-        WHERE supermarket_product_id = sp.id
-        ORDER BY date DESC, scraped_at DESC
-        LIMIT 1
-    ) ph ON true
+    {_LEFT_JOIN_LAST_PRICE}
     WHERE sp.product_id = :product_id
       AND sp.active = true
     ORDER BY sm.slug
 """)
 
 # Precios actuales por supermercado, solo los que tienen historial, ordenados precio ASC
-_PRICES_SQL = text("""
+_PRICES_SQL = text(f"""
     SELECT
         sm.slug  AS supermarket_slug,
         sm.name  AS supermarket_name,
@@ -121,13 +119,7 @@ _PRICES_SQL = text("""
         sp.image_url
     FROM supermarket_products sp
     JOIN supermarkets sm ON sm.id = sp.supermarket_id
-    JOIN LATERAL (
-        SELECT price, currency, date
-        FROM price_history
-        WHERE supermarket_product_id = sp.id
-        ORDER BY date DESC, scraped_at DESC
-        LIMIT 1
-    ) ph ON true
+    {_JOIN_LAST_PRICE}
     WHERE sp.product_id = :product_id
       AND sp.active = true
     ORDER BY ph.price ASC

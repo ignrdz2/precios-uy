@@ -12,3 +12,5 @@ pydantic-settings
 python-dotenv
 pytest
 pytest-asyncio
+aiosqlite
+httpx

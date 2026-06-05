@@ -26,7 +26,21 @@ class SupermarketProductsResponse(BaseModel):
 # SQL reutilizable
 # ---------------------------------------------------------------------------
 
-# Count de productos canónicos con precio disponible en un supermercado dado
+# Subquery de ventana reutilizable (igual que en products.py, portable con SQLite)
+_SM_LAST_PRICE_INNER = """(
+    SELECT supermarket_product_id, price, currency, date,
+           ROW_NUMBER() OVER (
+               PARTITION BY supermarket_product_id
+               ORDER BY date DESC, scraped_at DESC
+           ) AS _rn
+    FROM price_history
+) ph"""
+
+_SM_JOIN_LAST_PRICE = (
+    f"JOIN {_SM_LAST_PRICE_INNER} ON ph.supermarket_product_id = sp.id AND ph._rn = 1"
+)
+
+# EXISTS en lugar de LATERAL para el chequeo de "tiene al menos un precio"
 _SM_COUNT_SQL = text("""
     SELECT COUNT(DISTINCT p.id)
     FROM products p
@@ -34,29 +48,19 @@ _SM_COUNT_SQL = text("""
     JOIN supermarkets sm         ON sm.id = sp.supermarket_id
                                 AND sm.slug = :slug
                                 AND sm.active = true
-    JOIN LATERAL (
-        SELECT 1
-        FROM price_history
-        WHERE supermarket_product_id = sp.id
-        LIMIT 1
-    ) ph ON true
+    WHERE EXISTS (SELECT 1 FROM price_history WHERE supermarket_product_id = sp.id)
 """)
 
 # Productos paginados de un supermercado, con el precio de ESE supermercado únicamente
-_SM_PRODUCTS_SQL = text("""
+_SM_PRODUCTS_SQL = text(f"""
     WITH paginated_ids AS (
-        SELECT DISTINCT p.id
+        SELECT DISTINCT p.id, p.name
         FROM products p
         JOIN supermarket_products sp ON sp.product_id = p.id AND sp.active = true
         JOIN supermarkets sm         ON sm.id = sp.supermarket_id
                                     AND sm.slug = :slug
                                     AND sm.active = true
-        JOIN LATERAL (
-            SELECT 1
-            FROM price_history
-            WHERE supermarket_product_id = sp.id
-            LIMIT 1
-        ) ph ON true
+        WHERE EXISTS (SELECT 1 FROM price_history WHERE supermarket_product_id = sp.id)
         ORDER BY p.name ASC
         LIMIT :page_size OFFSET :offset
     )
@@ -79,13 +83,7 @@ _SM_PRODUCTS_SQL = text("""
     JOIN supermarkets sm        ON sm.id = sp.supermarket_id
                                AND sm.slug = :slug
                                AND sm.active = true
-    JOIN LATERAL (
-        SELECT price, currency, date
-        FROM price_history
-        WHERE supermarket_product_id = sp.id
-        ORDER BY date DESC, scraped_at DESC
-        LIMIT 1
-    ) ph ON true
+    {_SM_JOIN_LAST_PRICE}
     ORDER BY p.name ASC
 """)
 
