@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import BackgroundTasks, Depends, FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +42,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="uy-precios", version="0.1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 app.include_router(products_router, prefix="/api/v1")
 app.include_router(supermarkets_router, prefix="/api/v1")
