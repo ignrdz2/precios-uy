@@ -2,8 +2,9 @@ from datetime import date
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, text
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.types import Date, String
 
 from app.db.session import get_db
 from app.models.product import Product
@@ -47,6 +48,13 @@ _WHERE_FILTERS = """
     AND (:supermarket IS NULL OR sm.slug = :supermarket)
 """
 
+_FILTER_BINDPARAMS = [
+    bindparam("q", type_=String),
+    bindparam("q_pattern", type_=String),
+    bindparam("category", type_=String),
+    bindparam("supermarket", type_=String),
+]
+
 _COUNT_SQL = text(f"""
     SELECT COUNT(DISTINCT p.id)
     FROM products p
@@ -54,7 +62,7 @@ _COUNT_SQL = text(f"""
     JOIN supermarkets sm ON sm.id = sp.supermarket_id AND sm.active = true
     {_JOIN_LAST_PRICE}
     WHERE {_WHERE_FILTERS}
-""")
+""").bindparams(*_FILTER_BINDPARAMS)
 
 _LIST_SQL = text(f"""
     WITH paginated_ids AS (
@@ -86,7 +94,7 @@ _LIST_SQL = text(f"""
     JOIN supermarkets sm        ON sm.id = sp.supermarket_id AND sm.active = true
     {_JOIN_LAST_PRICE}
     ORDER BY p.id, sm.slug
-""")
+""").bindparams(*_FILTER_BINDPARAMS)
 
 _DETAIL_SPS_SQL = text(f"""
     SELECT
@@ -138,7 +146,10 @@ _HISTORY_SQL = text("""
       AND (:from_date IS NULL OR ph.date >= :from_date)
       AND (:to_date   IS NULL OR ph.date <= :to_date)
     ORDER BY s.slug, ph.date ASC
-""")
+""").bindparams(
+    bindparam("from_date", type_=Date),
+    bindparam("to_date", type_=Date),
+)
 
 
 # ---------------------------------------------------------------------------
