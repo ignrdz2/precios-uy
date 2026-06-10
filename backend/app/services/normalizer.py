@@ -34,6 +34,8 @@ class ProductNormalizer:
     # Patrones de normalización de unidades: (regex, reemplazo)
     # El orden importa: las formas más largas van primero para evitar
     # que "litros" sea capturado parcialmente antes que "litro".
+    # Las abreviaciones sueltas ("l", "g") van al final para no interferir
+    # con formas más largas.
     _UNIT_SUBS: list[tuple[str, str]] = [
         (r"\b(\d+(?:[,.]\d+)?)\s*mililitros?\b", r"\1ml"),
         (r"\b(\d+(?:[,.]\d+)?)\s*ml\b",          r"\1ml"),
@@ -46,7 +48,17 @@ class ProductNormalizer:
         (r"\b(\d+(?:[,.]\d+)?)\s*kg\b",           r"\1kg"),
         (r"\b(\d+(?:[,.]\d+)?)\s*gramos?\b",      r"\1g"),
         (r"\b(\d+(?:[,.]\d+)?)\s*grs?\b",         r"\1g"),
+        # Abreviaciones sueltas (van últimas para no interferir con las anteriores)
+        (r"\b(\d+(?:[,.]\d+)?)\s*l\b",            r"\1l"),
+        (r"\b(\d+(?:[,.]\d+)?)\s*g\b",            r"\1g"),
     ]
+
+    # Extrae tokens cantidad+unidad del texto preprocesado.
+    # Reconoce el patrón normalizado: dígitos pegados a la unidad (ej. "970g", "200ml").
+    # Nota: decimales como "1.5l" → tras el preprocesado quedan como "1 5l";
+    # el patrón extrae "5l", que es suficiente para distinguir entre tamaños
+    # distintos de forma consistente.
+    _QUANTITY_PATTERN = re.compile(r"\b(\d+)(ml|kg|g|l)\b")
 
     # ------------------------------------------------------------------
     # Método principal
@@ -107,7 +119,9 @@ class ProductNormalizer:
                 )
 
             elif score >= _SCORE_TENTATIVE:
-                # Match con confianza media — asignar pero alertar para revisión humana
+                # Match con confianza media — asignar pero alertar para revisión humana.
+                # Estos matches habilitan la comparación cross-supermercado para productos
+                # con nombres ligeramente distintos entre cadenas (ej. "sachet" extra, etc.)
                 sp.product_id = product_id
                 stats["matched_tentative"] += 1
                 logger.warning(
@@ -188,33 +202,60 @@ class ProductNormalizer:
     # Fuzzy matching
     # ------------------------------------------------------------------
 
-    @staticmethod
+    @classmethod
+    def _extract_quantities(cls, preprocessed: str) -> set[str]:
+        """Extrae tokens de cantidad+unidad del texto preprocesado.
+
+        Ejemplos:
+            "dulce de leche conaprole 970g"  → {"970g"}
+            "jugo conaprole naranja 200ml"   → {"200ml"}
+            "jugo conaprole naranja con pulpa 1l" → {"1l"}
+        """
+        return {m.group(1) + m.group(2) for m in cls._QUANTITY_PATTERN.finditer(preprocessed)}
+
+    @classmethod
     def _find_best_match(
+        cls,
         preprocessed: str,
         canonical_index: list[tuple[int, str]],
     ) -> tuple[int | None, float]:
-        """Devuelve (product_id, score) del canónico más parecido.
+        """Devuelve (product_id, score) del canónico más parecido con cantidad compatible.
 
-        Usa token_sort_ratio de rapidfuzz, que es robusto al orden de palabras:
-        "leche entera conaprole" y "conaprole leche entera" dan score 100.
+        Usa token_sort_ratio de rapidfuzz (robusto al orden de palabras) para
+        encontrar los mejores candidatos, luego descarta los que tengan una
+        cantidad distinta (ej. "970g" ≠ "500g") para evitar agrupar variantes
+        de tamaño distintas bajo el mismo producto canónico.
 
-        Si no hay canónicos, devuelve (None, 0.0).
+        Si no hay canónicos o ninguno tiene cantidades compatibles, devuelve (None, 0.0).
         """
         if not canonical_index:
             return None, 0.0
 
+        candidate_qtys = cls._extract_quantities(preprocessed)
         names = [name for _, name in canonical_index]
-        result = process.extractOne(
+
+        # Obtener los mejores candidatos por similitud de texto
+        results = process.extract(
             preprocessed,
             names,
             scorer=fuzz.token_sort_ratio,
+            limit=20,
         )
-        if result is None:
-            return None, 0.0
 
-        _best_name, score, idx = result
-        product_id = canonical_index[idx][0]
-        return product_id, float(score)
+        for best_name, score, idx in results:
+            canonical_qtys = cls._extract_quantities(best_name)
+            # Descartar si ambos tienen cantidades y son distintas
+            if candidate_qtys and canonical_qtys and candidate_qtys != canonical_qtys:
+                logger.debug(
+                    "[normalizer] descartado por cantidad incompatible: '%s' (qty=%s) "
+                    "vs canónico '%s' (qty=%s) score=%.0f",
+                    preprocessed, candidate_qtys, best_name, canonical_qtys, score,
+                )
+                continue
+            return canonical_index[idx][0], float(score)
+
+        # Ningún candidato es compatible → nuevo canónico
+        return None, 0.0
 
 
 # ------------------------------------------------------------------

@@ -1,12 +1,22 @@
-import { type CompareResponse } from '../api/client'
+import { type CompareEntry, type CompareResponse } from '../api/client'
 import { formatPrice } from '../utils/formatters'
+
+function deduplicateComparison(entries: CompareEntry[]): CompareEntry[] {
+  const seen = new Set<string>()
+  return entries.filter((e) => {
+    if (seen.has(e.supermarket_slug)) return false
+    seen.add(e.supermarket_slug)
+    return true
+  })
+}
 
 interface PriceCompareTableProps {
   compare: CompareResponse
 }
 
 export default function PriceCompareTable({ compare }: PriceCompareTableProps) {
-  const { comparison, cheapest } = compare
+  const { cheapest } = compare
+  const comparison = deduplicateComparison(compare.comparison)
 
   if (comparison.length === 0) {
     return (

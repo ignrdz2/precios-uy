@@ -1,7 +1,9 @@
 """Scraper para Disco Uruguay (https://www.disco.com.uy).
 
-El sitio es una SPA Blazor/.NET que sirve 20 productos por página.
-La paginación usa ?page=N — no hay botón "Ver más" ni scroll infinito.
+El sitio es una SPA Blazor Server que carga productos via SignalR (WebSocket).
+La paginación es scroll infinito: cada scroll hasta el fondo del DOM
+dispara un evento Blazor que renderiza 20 productos adicionales.
+El parámetro ?page=N no funciona — el router Blazor lo ignora.
 
 Selectores verificados en producción (junio 2026) inspeccionando el DOM real.
 """
@@ -16,9 +18,10 @@ from .base import BaseScraper, ScrapedProduct
 
 logger = logging.getLogger(__name__)
 
-_PAGE_TIMEOUT_MS = 30_000
-_MAX_PAGES = 80          # tope de seguridad: 80 × 20 ≈ 1.600 productos por categoría
-_PRODUCTS_PER_PAGE = 20  # el sitio siempre devuelve 20 por página excepto la última
+_PAGE_TIMEOUT_MS  = 30_000
+_SCROLL_WAIT_SEC  = 4.0   # Blazor Server responde por SignalR en ~3-4 s por scroll
+_MAX_SCROLL_ITERS = 25    # tope de seguridad: 25 × 20 = 500 productos por categoría
+_MAX_STALE_ITERS  = 2     # scrolls consecutivos sin nuevos productos → fin de categoría
 
 
 class DiscoScraper(BaseScraper):
@@ -91,44 +94,50 @@ class DiscoScraper(BaseScraper):
                 await context.close()
 
     # ------------------------------------------------------------------
-    # Iteración por páginas (?page=N)
+    # Scroll infinito Blazor Server
     # ------------------------------------------------------------------
 
     async def _scrape_category_all_pages(
         self, page: Page, base_url: str, category_name: str
     ) -> list[ScrapedProduct]:
-        """Itera ?page=1, ?page=2, … hasta que una página devuelve menos de 20 productos."""
-        all_products: list[ScrapedProduct] = []
+        """Carga la categoría completa mediante scroll infinito.
 
-        for page_num in range(1, _MAX_PAGES + 1):
-            url = f"{base_url}?page={page_num}"
-            page_products = await self._scrape_single_page(page, url, category_name)
-
-            all_products.extend(page_products)
-
-            if len(page_products) < _PRODUCTS_PER_PAGE:
-                break  # última página: menos de 20 productos o página vacía
-
-            await self._random_delay()
-
-        return all_products
-
-    async def _scrape_single_page(
-        self, page: Page, url: str, category_name: str
-    ) -> list[ScrapedProduct]:
-        logger.debug("[disco] → %s", url)
+        El sitio usa Blazor Server + SignalR: cada scroll hasta el fondo del DOM
+        dispara un evento Blazor que renderiza 20 productos adicionales (~4 s de
+        latencia por respuesta del servidor). El parámetro ?page=N no tiene efecto.
+        """
+        logger.debug("[disco] cargando %s", base_url)
 
         try:
-            await page.goto(url, wait_until="networkidle")
+            await page.goto(base_url, wait_until="networkidle")
         except Exception:
-            logger.warning("[disco] timeout networkidle en %s, reintentando con 'load'", url)
-            await page.goto(url, wait_until="load")
+            logger.warning("[disco] timeout networkidle en %s, reintentando con 'load'", base_url)
+            await page.goto(base_url, wait_until="load")
 
         try:
             await page.wait_for_selector(self._SEL_PRODUCT_CARD, timeout=_PAGE_TIMEOUT_MS)
         except Exception:
-            logger.debug("[disco] sin tarjetas en %s — fin de paginación", url)
+            logger.debug("[disco] sin tarjetas en %s", base_url)
             return []
+
+        stale = 0
+        prev_count = 0
+
+        for scroll_n in range(_MAX_SCROLL_ITERS):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(_SCROLL_WAIT_SEC)
+
+            current = await page.locator(self._SEL_PRODUCT_CARD).count()
+            logger.debug("[disco] %s — %d tarjetas (scroll %d)", category_name, current, scroll_n + 1)
+
+            if current == prev_count:
+                stale += 1
+                if stale >= _MAX_STALE_ITERS:
+                    logger.debug("[disco] %s — sin nuevos productos, fin de scroll", category_name)
+                    break
+            else:
+                stale = 0
+            prev_count = current
 
         return await self._extract_products(page, category_name)
 
