@@ -18,11 +18,12 @@
 10. [Capa API REST](#10-capa-api-rest)
 11. [Gestión de la base de datos](#11-gestión-de-la-base-de-datos)
 12. [Configuración e infraestructura](#12-configuración-e-infraestructura)
-13. [Estructura del repositorio](#13-estructura-del-repositorio)
-14. [Guía operacional](#14-guía-operacional)
-15. [Cómo agregar un supermercado nuevo](#15-cómo-agregar-un-supermercado-nuevo)
-16. [Testing](#16-testing)
-17. [Limitaciones conocidas y decisiones de diseño](#17-limitaciones-conocidas-y-decisiones-de-diseño)
+13. [Frontend React](#13-frontend-react)
+14. [Estructura del repositorio](#14-estructura-del-repositorio)
+15. [Guía operacional](#15-guía-operacional)
+16. [Cómo agregar un supermercado nuevo](#16-cómo-agregar-un-supermercado-nuevo)
+17. [Testing](#17-testing)
+18. [Limitaciones conocidas y decisiones de diseño](#18-limitaciones-conocidas-y-decisiones-de-diseño)
 
 ---
 
@@ -56,7 +57,7 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
 | Endpoints API REST `/api/v1/supermarkets` | ✅ Completo (Fase 2) |
 | Endpoints de sistema `/health` y `/scrapes` | ✅ Completo (Fase 2) |
 | Tests de API con SQLite en memoria | ✅ Completo (Fase 2) |
-| Frontend React | 🔄 Pendiente (Fase 3) |
+| Frontend React | ✅ Completo (Fase 3) |
 
 ---
 
@@ -189,6 +190,12 @@ La arquitectura está diseñada para ser operada con un único comando (`docker 
 | Contenedores | Docker Compose | v2 | Un comando levanta todo el stack; parity entre entornos |
 | Cliente HTTP de tests | httpx | latest | `AsyncClient` + `ASGITransport` para tests de integración sin servidor real |
 | Driver SQLite async | aiosqlite | latest | Backend de tests en memoria; elimina la dependencia de PostgreSQL en el CI |
+| Framework UI | React | 18.3 | Biblioteca de componentes declarativa con hooks |
+| Build tool | Vite | 5.4 | Dev server con HMR y proxy inverso al backend; bundler de producción |
+| Lenguaje frontend | TypeScript | 5.6 | Tipado estático; los tipos del cliente espejean los schemas Pydantic del backend |
+| Estilos | Tailwind CSS | 3.4 | Clases utilitarias; sin archivos CSS custom en el proyecto |
+| Gráficos | Recharts | 2.13 | Wrapper React de D3; consume el endpoint `/history` directamente |
+| Router frontend | React Router | 6.27 | Navegación client-side entre `/` y `/products/:id` |
 
 ---
 
@@ -1047,7 +1054,12 @@ Define tres servicios:
 - Volumen `./backend:/app` para hot-reload en desarrollo
 - Variables de entorno: `DATABASE_URL` (con driver `asyncpg`), `SCRAPE_SCHEDULE_HOUR`, `LOG_LEVEL`
 
-**`frontend`** — Comentado (Fase 3 pendiente).
+**`frontend`** — Build desde `./frontend/Dockerfile` (Node 20 Alpine).
+- `depends_on: backend`
+- Puerto `5173:5173`
+- Volúmenes: `./frontend:/app` (hot-reload) y `/app/node_modules` (preserva módulos del contenedor)
+- Corre `npm run dev -- --host 0.0.0.0` (servidor Vite accesible desde el host)
+- Proxy inverso en `vite.config.ts`: `/api/*`, `/health` y `/scrapes` → `http://backend:8000`
 
 ### `backend/Dockerfile`
 
@@ -1065,7 +1077,127 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload
 
 ---
 
-## 13. Estructura del repositorio
+## 13. Frontend React
+
+### Stack tecnológico del frontend
+
+| Tecnología | Versión | Rol |
+|---|---|---|
+| React | 18.3 | Biblioteca de componentes declarativa con hooks |
+| TypeScript | 5.6 | Tipado estático; los tipos del cliente espejean los schemas Pydantic del backend |
+| Vite | 5.4 | Dev server con HMR y proxy inverso; bundler de producción |
+| React Router | 6.27 | Navegación client-side (SPA con dos rutas) |
+| Tailwind CSS | 3.4 | Clases utilitarias; sin archivos CSS custom en el proyecto |
+| Recharts | 2.13 | Wrapper React de D3; consume el endpoint `/history` directamente |
+
+### Arquitectura del frontend
+
+El frontend es una SPA (Single Page Application) servida por el servidor de desarrollo Vite en el puerto 5173. Las llamadas HTTP se hacen a URLs relativas (e.g., `/api/v1/products`); el proxy configurado en `vite.config.ts` las redirige transparentemente al backend:
+
+```
+Frontend (Vite SPA :5173)
+    │
+    ├── /api/*    ──proxy──▶  http://backend:8000/api/*
+    ├── /health   ──proxy──▶  http://backend:8000/health
+    └── /scrapes  ──proxy──▶  http://backend:8000/scrapes
+```
+
+Este diseño evita problemas de CORS y elimina la necesidad de hardcodear la URL del backend en el código de la aplicación. `BASE_URL = ''` en el cliente HTTP hace que todas las rutas sean relativas al origen del servidor Vite.
+
+### Páginas y rutas
+
+El router (`App.tsx`) define dos rutas envueltas en el componente `Layout`:
+
+| Ruta | Componente | Descripción |
+|---|---|---|
+| `/` | `HomePage` | Búsqueda, filtros y grid paginado de productos |
+| `/products/:id` | `ProductDetailPage` | Detalle, comparación entre supermercados e historial de precios |
+
+#### `HomePage`
+
+Gestiona cuatro estados reactivos: `q` (texto de búsqueda), `category`, `supermarket` y `page`. Cualquier cambio en un filtro dispara un `useEffect` que llama a `GET /api/v1/products`.
+
+**Componentes:**
+- `SearchBar` con debounce de 500ms
+- Sidebar colapsable en mobile (con `<details>/<summary>`) con `<select>` de categoría y supermercado
+- Grid de dos columnas con `ProductCard` en desktop, una columna en mobile
+- Paginación con botones "Anterior/Siguiente" cuando `pages > 1`
+
+**Detalles de implementación:**
+
+La bandera `cancelled = true` en el cleanup del `useEffect` evita race conditions cuando el usuario escribe rápido y llegan respuestas fuera de orden. Las categorías del `<select>` se extraen dinámicamente de los resultados actuales con `useMemo`, y si la categoría seleccionada desaparece de los resultados (por cambio de búsqueda), se resetea automáticamente. Al cambiar cualquier filtro —no la página— se resetea `page` a 1.
+
+#### `ProductDetailPage`
+
+Carga en paralelo con `Promise.all` los datos de comparación y el detalle completo:
+
+```typescript
+Promise.all([
+  getProductCompare(id),  // precios actuales + cheapest + difference
+  getProduct(id),         // detalle con name_raw por supermarket_product
+])
+```
+
+Tres secciones en la página:
+1. **Comparación de precios** — `PriceCompareTable` con badge "Más barato" y diferencia porcentual
+2. **Historial de precios** — `PriceHistoryChart` con gráfico de líneas Recharts
+3. **Nombres originales** — tabla que muestra `name_raw` de cada `supermarket_product`
+
+Diferencia explícita entre HTTP 404 (producto no existe) y error de red/servidor: cada caso muestra un mensaje específico.
+
+### Componentes clave
+
+#### `PriceCompareTable`
+
+Recibe el `CompareResponse` del endpoint `/compare`. Antes de renderizar, deduplica entradas por `supermarket_slug` con la función `deduplicateComparison()`. El primer elemento de `comparison` es el más barato (el backend ordena `ASC` por precio); la diferencia de cada fila se calcula en el cliente como `entry.price - minPrice`.
+
+Cuando hay más de un supermercado, muestra la columna "Diferencia" con:
+- Badge verde "✓ Más barato" para el supermercado con menor precio
+- Texto rojo `+$N (+X.X%)` para los más caros
+
+#### `PriceHistoryChart`
+
+Hace su propio fetch a `GET /api/v1/products/{id}/history` (sin parámetros de fecha → sin límite por defecto). El resultado `{slug: PricePoint[]}` alimenta a Recharts con una `Line` por supermercado. Los colores están fijos en `getSupermarketColor`:
+
+| Supermercado | Color |
+|---|---|
+| `tienda_inglesa` | `#2563eb` (azul) |
+| `disco` | `#dc2626` (rojo) |
+| Futuros supermercados | Paleta de 4 colores fallback |
+
+#### `SearchBar`
+
+Implementa debounce de 500ms internamente con `setTimeout`/`clearTimeout`, sin dependencias externas. El estado del texto vive en el componente padre (`HomePage`); `SearchBar` expone `value` y `onChange`.
+
+### Cliente de API — `src/api/client.ts`
+
+Centraliza todas las llamadas HTTP y define los tipos TypeScript que espejean los schemas Pydantic del backend:
+
+| Función | Endpoint | Descripción |
+|---|---|---|
+| `getProducts(params)` | `GET /api/v1/products` | Listado paginado con `q`, `category`, `supermarket`, `page` |
+| `getProduct(id)` | `GET /api/v1/products/{id}` | Detalle completo con `supermarket_products` |
+| `getProductCompare(id)` | `GET /api/v1/products/{id}/compare` | Comparación entre supermercados con diferencias |
+| `getProductHistory(id, params)` | `GET /api/v1/products/{id}/history` | Serie temporal `{slug: PricePoint[]}` |
+| `getSupermarkets()` | `GET /api/v1/supermarkets` | Lista de supermercados activos |
+| `getHealth()` | `GET /health` | Estado del sistema y último scrape |
+
+La función interna `fetchJSON<T>` lanza un `Error` si la respuesta no es `ok`, preservando el código HTTP en el mensaje (`"Error 404: ..."`) para que los componentes puedan diferenciar 404 de otros errores.
+
+### Utilidades — `src/utils/formatters.ts`
+
+| Función | Entrada | Salida |
+|---|---|---|
+| `formatPrice(price)` | `1299` | `"$1.299"` (locale `es-UY`, separadores correctos para Uruguay) |
+| `formatDate(dateStr)` | `"2024-11-15"` | `"15 de noviembre de 2024"` |
+| `formatDateShort(dateStr)` | `"2024-11-15"` | `"15 nov"` |
+| `getSupermarketColor(slug, idx)` | `"tienda_inglesa"` | `"#2563eb"` |
+
+`formatPrice` usa `Intl.NumberFormat` con locale `'es-UY'`. Las funciones de fecha agregan `T00:00:00` al string antes de construir el `Date` para evitar el desplazamiento de zona horaria que ocurre cuando se parsea solo `YYYY-MM-DD`.
+
+---
+
+## 14. Estructura del repositorio
 
 ```
 uy-precios/
@@ -1134,12 +1266,35 @@ uy-precios/
 │       ├── test_normalizer.py      # Tests del pipeline de normalización
 │       └── test_api.py             # Tests de integración de la API REST
 │
-└── frontend/                   # Pendiente (Fase 3)
+└── frontend/
+    ├── Dockerfile               # Node 20 Alpine + Vite dev server
+    ├── package.json
+    ├── tsconfig.json
+    ├── vite.config.ts           # Proxy inverso: /api/*, /health, /scrapes → backend:8000
+    ├── tailwind.config.js
+    └── src/
+        ├── main.tsx             # Entry point de React
+        ├── App.tsx              # Router raíz con dos rutas
+        ├── api/
+        │   └── client.ts        # Tipos TypeScript + funciones de fetch tipadas
+        ├── components/
+        │   ├── Layout.tsx       # Wrapper de página con header y contenedor
+        │   ├── SearchBar.tsx    # Input con debounce de 500ms
+        │   ├── ProductCard.tsx  # Tarjeta de producto en el grid de resultados
+        │   ├── PriceCompareTable.tsx  # Tabla de comparación + badge "Más barato"
+        │   ├── PriceHistoryChart.tsx  # Gráfico de líneas Recharts
+        │   ├── LoadingSpinner.tsx     # Indicador de carga
+        │   └── ErrorMessage.tsx       # Error con botón retry
+        ├── pages/
+        │   ├── HomePage.tsx     # Búsqueda + filtros sidebar + grid paginado
+        │   └── ProductDetailPage.tsx  # Detalle + comparador + historial
+        └── utils/
+            └── formatters.ts    # formatPrice, formatDate, getSupermarketColor
 ```
 
 ---
 
-## 14. Guía operacional
+## 15. Guía operacional
 
 ### Primer arranque
 
@@ -1157,8 +1312,13 @@ docker compose exec backend alembic upgrade head
 # 4. Insertar supermercados iniciales
 docker compose exec backend python -m app.db.seed
 
-# 5. Verificar que el backend está operativo
-curl http://localhost:8000/health
+# 5. Ejecutar el primer scrape (dura entre 5 y 15 minutos)
+docker compose exec backend python -m app.scrapers.run
+
+# 6. Acceder a la aplicación
+# Frontend:   http://localhost:5173
+# Swagger UI: http://localhost:8000/docs
+# Health:     http://localhost:8000/health
 ```
 
 ### Ejecutar el scrape manualmente
@@ -1248,7 +1408,7 @@ LIMIT 10;
 
 ---
 
-## 15. Cómo agregar un supermercado nuevo
+## 16. Cómo agregar un supermercado nuevo
 
 La arquitectura de scrapers está diseñada para que esta operación no requiera modificar ningún archivo existente.
 
@@ -1310,7 +1470,7 @@ La normalización, la API y el frontend funcionan automáticamente con el nuevo 
 
 ---
 
-## 16. Testing
+## 17. Testing
 
 ### Estructura
 
@@ -1407,7 +1567,7 @@ pytest tests/ --cov=app --cov-report=term-missing
 
 ---
 
-## 17. Limitaciones conocidas y decisiones de diseño
+## 18. Limitaciones conocidas y decisiones de diseño
 
 ### Tabla de decisiones
 
