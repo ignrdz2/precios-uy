@@ -1,20 +1,9 @@
-"""Scraper para Tienda Inglesa (https://www.tinglesa.com.uy).
+"""Scraper para Tienda Inglesa (https://www.tiendainglesa.com.uy).
 
-El sitio es una SPA con JavaScript (plataforma VTEX), por lo que toda la
-extracción se hace con Playwright — no requests/httpx.
+El sitio es una plataforma propietaria GeneXus.
+Usa scroll infinito — comienza con 40 productos y carga más al bajar.
 
-AVISO SOBRE SELECTORES CSS
----------------------------
-Cada constante con prefijo _SEL_ es una suposición basada en la plataforma
-VTEX (común en supermercados uruguayos). Deben verificarse contra el sitio
-real antes de que este scraper pueda producir datos reales.
-
-Cómo verificar:
-  1. Abrir https://www.tinglesa.com.uy en Chrome DevTools
-  2. Navegar a cualquier página de listado de categoría
-  3. Inspeccionar una tarjeta de producto y mapear el elemento a cada
-     constante _SEL_* de abajo
-  4. Reemplazar el selector provisional y eliminar el comentario TODO
+Selectores verificados en producción (junio 2026) inspeccionando el DOM real.
 """
 
 import asyncio
@@ -27,56 +16,31 @@ from .base import BaseScraper, ScrapedProduct
 
 logger = logging.getLogger(__name__)
 
-_PAGE_TIMEOUT_MS = 30_000
-_SCROLL_PAUSE_S = 1.5
-_MAX_LOAD_ITERATIONS = 80  # tope de seguridad: ~80 × 20 productos ≈ 1.600 por categoría
+_PAGE_TIMEOUT_MS  = 30_000
+_SCROLL_PAUSE_S   = 2.0
+_MAX_SCROLL_ITERS = 120  # tope de seguridad para scroll infinito
 
 
 class TiendaInglesaScraper(BaseScraper):
-    BASE_URL = "https://www.tinglesa.com.uy"
+    BASE_URL = "https://www.tiendainglesa.com.uy"
 
-    # ------------------------------------------------------------------
-    # URLs de categorías
-    # TODO: Abrir tinglesa.com.uy, navegar por el menú principal y copiar
-    #       el href exacto de cada categoría para verificar/reemplazar abajo.
-    # ------------------------------------------------------------------
     CATEGORIES: dict[str, str] = {
-        "lacteos": f"{BASE_URL}/lacteos-y-huevos",
-        "carnes": f"{BASE_URL}/carnes-y-aves",
-        "verduras": f"{BASE_URL}/frutas-y-verduras",
-        "bebidas": f"{BASE_URL}/bebidas",
-        "limpieza": f"{BASE_URL}/limpieza-del-hogar",
+        "lacteos":  f"{BASE_URL}/supermercado/categoria/frescos/lacteos/busqueda?0,0,*%3A*,1894,209,0,rel,,false,,,,0",
+        "carnes":   f"{BASE_URL}/supermercado/categoria/frescos/carnes/busqueda?0,0,*%3A*,1894,173,0,rel,,false,,,,0",
+        "verduras": f"{BASE_URL}/supermercado/categoria/frescos/verduras/busqueda?0,0,*%3A*,1894,196,0,rel,,false,,,,0",
+        "frutas":   f"{BASE_URL}/supermercado/categoria/frescos/frutas/busqueda?0,0,*%3A*,1894,195,0,rel,,false,,,,0",
+        "bebidas":  f"{BASE_URL}/supermercado/categoria/bebidas/1001",
+        "limpieza": f"{BASE_URL}/supermercado/categoria/limpieza/1895",
     }
 
-    # ------------------------------------------------------------------
-    # Selectores CSS — todos requieren verificación en el navegador
-    # (ver docstring del módulo para instrucciones)
-    # ------------------------------------------------------------------
-
-    # Contenedor principal de una tarjeta de producto en el grid
-    # TODO: Inspeccionar el grid de productos; clase VTEX común: "vtex-product-summary-2-x-container"
-    _SEL_PRODUCT_CARD = ".vtex-product-summary-2-x-container"
-
-    # Elemento de texto con el nombre del producto dentro de la tarjeta
-    # TODO: Verificar; clase VTEX común: "vtex-product-summary-2-x-productNameContainer"
-    _SEL_PRODUCT_NAME = ".vtex-product-summary-2-x-productNameContainer"
-
-    # Precio de venta (precio final/con descuento, no el precio tachado)
-    # TODO: Verificar; clases VTEX comunes: "vtex-product-price-1-x-sellingPriceValue"
-    #       o ".sellingPrice .vtex-product-price-1-x-currencyContainer"
-    _SEL_PRODUCT_PRICE = ".vtex-product-price-1-x-sellingPriceValue"
-
-    # Etiqueta <a> cuyo href lleva a la página de detalle del producto
-    # TODO: Verificar; clase VTEX común: "vtex-product-summary-2-x-clearLink"
-    _SEL_PRODUCT_LINK = "a.vtex-product-summary-2-x-clearLink"
-
-    # Etiqueta <img> de la miniatura del producto
-    # TODO: Verificar; algunas implementaciones de lazy-load usan data-src en lugar de src
-    _SEL_PRODUCT_IMAGE = ".vtex-product-summary-2-x-image img"
-
-    # Botón "Cargar más" / "Ver más" (solo presente si el sitio usa carga manual)
-    # TODO: Verificar; puede estar ausente si el sitio usa scroll infinito automático
-    _SEL_LOAD_MORE_BTN = "button.vtex-button--primary[class*='load-more'], button[data-testid='show-more']"
+    # Selectores verificados contra el DOM real del sitio
+    _SEL_PRODUCT_CARD  = ".card-product-container"
+    _SEL_PRODUCT_NAME  = ".card-product-name"
+    # .ProductPrice apunta siempre al precio de venta vigente (ignora .wTxtProductPriceBefore)
+    _SEL_PRODUCT_PRICE = ".ProductPrice"
+    _SEL_PRODUCT_LINK  = ".card-product-container a"
+    # lazysizes: la imagen usa data-src antes de entrar al viewport
+    _SEL_PRODUCT_IMAGE = ".card-product-img"
 
     def __init__(self) -> None:
         super().__init__(supermarket_slug="tienda_inglesa")
@@ -103,9 +67,7 @@ class TiendaInglesaScraper(BaseScraper):
                             page, u, n
                         )
                     )
-                    logger.info(
-                        "[tienda_inglesa] %s → %d productos", category_name, len(products)
-                    )
+                    logger.info("[tienda_inglesa] %s → %d productos", category_name, len(products))
                     all_products.extend(products)
                     await self._random_delay()
             finally:
@@ -136,72 +98,36 @@ class TiendaInglesaScraper(BaseScraper):
     ) -> list[ScrapedProduct]:
         logger.debug("[tienda_inglesa] → %s", url)
 
-        # Navegar; si networkidle expira, reintentar con 'load'
         try:
             await page.goto(url, wait_until="networkidle")
         except Exception:
-            logger.warning(
-                "[tienda_inglesa] timeout de networkidle en %s, reintentando con 'load'", url
-            )
+            logger.warning("[tienda_inglesa] timeout networkidle en %s, reintentando con 'load'", url)
             await page.goto(url, wait_until="load")
 
-        # TODO: Si el sitio muestra un banner de cookies/GDPR en la primera visita,
-        #       agregar un click aquí para cerrarlo antes de contar tarjetas de producto.
-        #       Ejemplo: await page.locator("button[data-testid='accept-cookies']").click()
-
-        # Esperar a que aparezca al menos una tarjeta de producto antes de continuar
         try:
             await page.wait_for_selector(self._SEL_PRODUCT_CARD, timeout=_PAGE_TIMEOUT_MS)
         except Exception:
             logger.warning(
-                "[tienda_inglesa] no se encontraron tarjetas en %s — selector posiblemente incorrecto: %s",
+                "[tienda_inglesa] sin tarjetas en %s — selector: %s",
                 url,
                 self._SEL_PRODUCT_CARD,
             )
             return []
 
-        await self._load_all_products(page)
+        await self._scroll_until_stable(page)
         return await self._extract_products(page, category_name)
 
     # ------------------------------------------------------------------
-    # Paginación / scroll infinito
+    # Scroll infinito
     # ------------------------------------------------------------------
 
-    async def _load_all_products(self, page: Page) -> None:
-        """Expande la página hasta que todos los productos estén visibles.
-
-        Estrategia: si hay un botón 'cargar más', hace clic repetidamente.
-        De lo contrario, usa scroll infinito.
-        """
-        # TODO: Determinar qué estrategia usa el sitio real y eliminar la otra.
-        load_more_btn = page.locator(self._SEL_LOAD_MORE_BTN)
-        if await load_more_btn.count() > 0 and await load_more_btn.first.is_visible():
-            await self._click_load_more_until_exhausted(page, load_more_btn)
-        else:
-            await self._scroll_until_stable(page)
-
-    async def _click_load_more_until_exhausted(
-        self, page: Page, btn: Locator
-    ) -> None:
-        """Hace clic en 'cargar más' hasta que desaparece o deja de agregar productos."""
-        for _ in range(_MAX_LOAD_ITERATIONS):
-            if not (await btn.count() > 0 and await btn.first.is_visible()):
-                break
-            prev_count = await page.locator(self._SEL_PRODUCT_CARD).count()
-            try:
-                await btn.first.click()
-                await page.wait_for_load_state("networkidle", timeout=_PAGE_TIMEOUT_MS)
-            except Exception as exc:
-                logger.warning("[tienda_inglesa] fallo al hacer clic en 'cargar más': %s", exc)
-                break
-            new_count = await page.locator(self._SEL_PRODUCT_CARD).count()
-            if new_count == prev_count:
-                break  # botón clickeado pero no se cargaron productos nuevos — llegamos al final
-
     async def _scroll_until_stable(self, page: Page) -> None:
-        """Hace scroll al final de la página repetidamente hasta que el conteo de productos no cambia."""
+        """Hace scroll hasta que no aparecen productos nuevos.
+
+        El sitio carga en bloques: comienza con 40 y suma más al bajar.
+        """
         prev_count = 0
-        for _ in range(_MAX_LOAD_ITERATIONS):
+        for _ in range(_MAX_SCROLL_ITERS):
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(_SCROLL_PAUSE_S)
             current_count = await page.locator(self._SEL_PRODUCT_CARD).count()
@@ -216,9 +142,7 @@ class TiendaInglesaScraper(BaseScraper):
     async def _extract_products(self, page: Page, category_name: str) -> list[ScrapedProduct]:
         cards = page.locator(self._SEL_PRODUCT_CARD)
         total = await cards.count()
-        logger.debug(
-            "[tienda_inglesa] parseando %d tarjetas para categoría '%s'", total, category_name
-        )
+        logger.debug("[tienda_inglesa] parseando %d tarjetas — '%s'", total, category_name)
 
         products: list[ScrapedProduct] = []
         for i in range(total):
@@ -229,75 +153,58 @@ class TiendaInglesaScraper(BaseScraper):
             except Exception as exc:
                 logger.warning(
                     "[tienda_inglesa] fallo al parsear tarjeta %d en '%s': %s",
-                    i,
-                    category_name,
-                    exc,
+                    i, category_name, exc,
                 )
         return products
 
     async def _parse_card(self, card: Locator, category_name: str) -> ScrapedProduct | None:
         # ---- nombre --------------------------------------------------------
-        # TODO: Verificar _SEL_PRODUCT_NAME contra una tarjeta real del sitio
         name_el = card.locator(self._SEL_PRODUCT_NAME)
         if await name_el.count() == 0:
-            logger.warning("[tienda_inglesa] tarjeta sin elemento de nombre — omitiendo")
             return None
         name_raw = (await name_el.first.inner_text()).strip()
         if not name_raw:
             return None
 
         # ---- precio --------------------------------------------------------
-        # TODO: Verificar _SEL_PRODUCT_PRICE; asegurarse de que apunta al precio
-        #       de venta y no al precio original tachado.
+        # .ProductPrice apunta al precio de venta; ignora el tachado (.wTxtProductPriceBefore)
+        # y el precio con ClubCard (.ProductSpecialPrice)
         price_el = card.locator(self._SEL_PRODUCT_PRICE)
         if await price_el.count() == 0:
-            logger.warning(
-                "[tienda_inglesa] sin elemento de precio para '%s' — omitiendo", name_raw
-            )
+            logger.warning("[tienda_inglesa] sin precio para '%s' — omitiendo", name_raw)
             return None
         price_raw = (await price_el.first.inner_text()).strip()
         price = self._parse_price(price_raw)
         if price is None:
             logger.warning(
-                "[tienda_inglesa] no se puede parsear precio '%s' para '%s' — omitiendo",
-                price_raw,
-                name_raw,
+                "[tienda_inglesa] precio no parseable '%s' para '%s' — omitiendo",
+                price_raw, name_raw,
             )
             return None
 
-        # ---- URL del producto -----------------------------------------------
-        # TODO: Verificar _SEL_PRODUCT_LINK
+        # ---- URL y external_id ---------------------------------------------
+        # data-id en el contenedor es el product ID (más estable que el SKU/id del elemento)
+        external_id: str | None = await card.get_attribute("data-id")
+
         link_el = card.locator(self._SEL_PRODUCT_LINK)
         href: str | None = None
         if await link_el.count() > 0:
             href = await link_el.first.get_attribute("href")
+
         if href:
             product_url = href if href.startswith("http") else self.BASE_URL + href
         else:
-            # URL desconocida pero tenemos nombre y precio — conservar el producto
             product_url = self.BASE_URL
             logger.warning("[tienda_inglesa] sin href para '%s'", name_raw)
 
-        # ---- external_id ---------------------------------------------------
-        # TODO: Inspeccionar el elemento card en DevTools.
-        # VTEX almacena el ID del producto en data-product-id o data-sku-id en el
-        # elemento raíz de la tarjeta; verificar cuál atributo está presente.
-        external_id = (
-            await card.get_attribute("data-product-id")
-            or await card.get_attribute("data-sku-id")
-            or await card.get_attribute("data-id")
-        )
-        if not external_id and href:
-            # Fallback: usar el último segmento de la URL (slug o ID numérico)
-            external_id = href.rstrip("/").split("/")[-1].split("?")[0] or None
-
         # ---- imagen --------------------------------------------------------
-        # TODO: Verificar _SEL_PRODUCT_IMAGE; revisar si hay lazy-load (data-src vs src)
+        # lazysizes: usar data-src como fuente primaria (src se llena al entrar al viewport)
         image_url: str | None = None
         img_el = card.locator(self._SEL_PRODUCT_IMAGE)
         if await img_el.count() > 0:
-            image_url = await img_el.first.get_attribute("src") or await img_el.first.get_attribute(
-                "data-src"
+            image_url = (
+                await img_el.first.get_attribute("data-src")
+                or await img_el.first.get_attribute("src")
             )
 
         return ScrapedProduct(
@@ -316,25 +223,25 @@ class TiendaInglesaScraper(BaseScraper):
 
     @staticmethod
     def _parse_price(raw: str) -> float | None:
-        """Convierte un string de precio uruguayo a float.
+        """Convierte strings de precio uruguayo a float.
 
         Formatos soportados:
-            "$1.299"      → 1299.0
+            "$ 125"       → 125.0
+            "$ 1.299"     → 1299.0
+            "$ 101,15"    → 101.15
             "$ 1.299,90"  → 1299.9
-            "1.299,00"    → 1299.0
-            "1299"        → 1299.0
         """
-        # Eliminar símbolo de moneda, espacios y caracteres no numéricos excepto . y ,
         cleaned = re.sub(r"[^\d.,]", "", raw).strip()
         if not cleaned:
             return None
 
         if "," in cleaned:
-            # Formato UY con coma decimal: "1.299,90" → "1299.90"
+            # Coma como decimal; punto (si aparece) es separador de miles
             cleaned = cleaned.replace(".", "").replace(",", ".")
         else:
-            # Sin coma decimal: los puntos son separadores de miles — "1.299" → "1299"
-            cleaned = cleaned.replace(".", "")
+            dot_pos = cleaned.rfind(".")
+            if dot_pos != -1 and len(cleaned) - dot_pos - 1 == 3:
+                cleaned = cleaned.replace(".", "")  # "1.299" → miles
 
         try:
             value = float(cleaned)
@@ -345,6 +252,38 @@ class TiendaInglesaScraper(BaseScraper):
 
     @staticmethod
     def _category_name_from_url(url: str) -> str:
-        """Obtiene un nombre de categoría legible a partir de un segmento de URL."""
-        segment = url.rstrip("/").split("/")[-1]
-        return segment.replace("-", " ").replace("_", " ").title()
+        """Extrae el slug de categoría legible de una URL de tiendainglesa.com.uy.
+
+        /supermercado/categoria/frescos/lacteos/busqueda?... → "Lacteos"
+        /supermercado/categoria/bebidas/1001               → "Bebidas"
+        """
+        # Tomar la parte antes del query string
+        path = url.split("?")[0].rstrip("/")
+        parts = path.split("/")
+        # Ignorar segmentos reservados y el ID numérico final
+        reserved = {"", "supermercado", "categoria", "busqueda", "categoria"}
+        for segment in reversed(parts):
+            if not segment.isdigit() and segment not in reserved:
+                return segment.replace("-", " ").replace("_", " ").title()
+        return parts[-1]
+
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        stream=sys.stdout,
+    )
+
+    async def _main() -> None:
+        scraper = TiendaInglesaScraper()
+        products = await scraper.scrape_all()
+        print(f"\nProductos encontrados: {len(products)}")
+        for p in products[:5]:
+            print(f"  {p.name_raw!r:50s}  ${p.price:.2f}  [{p.category}]")
+        if len(products) > 5:
+            print(f"  ... y {len(products) - 5} más")
+
+    asyncio.run(_main())

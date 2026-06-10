@@ -36,10 +36,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def run_all_scrapers() -> None:
-    """Orquesta el pipeline completo: scrape → guardar → normalizar."""
+_ALL_SCRAPERS: dict[str, BaseScraper] = {
+    "tienda_inglesa": TiendaInglesaScraper(),
+    "disco": DiscoScraper(),
+}
+
+
+async def run_all_scrapers(only: list[str] | None = None) -> None:
+    """Orquesta el pipeline completo: scrape → guardar → normalizar.
+
+    Args:
+        only: lista de slugs a correr (ej. ["tienda_inglesa"]). None = todos.
+    """
     start = time.monotonic()
-    logger.info("=== Iniciando scrape completo ===")
+    scrapers = {k: v for k, v in _ALL_SCRAPERS.items() if only is None or k in only}
+    logger.info("=== Iniciando scrape: %s ===", ", ".join(scrapers))
 
     scrape_run_id = await _start_scrape_run()
 
@@ -52,15 +63,12 @@ async def run_all_scrapers() -> None:
             logger.error("Base de datos no disponible: %s", exc)
             raise RuntimeError(f"No se puede conectar a la base de datos: {exc}") from exc
 
-        # Correr ambos scrapers en paralelo; return_exceptions=True evita cancelar
-        # el otro scraper si uno falla
         scrape_results = await asyncio.gather(
-            _run_scraper(TiendaInglesaScraper()),
-            _run_scraper(DiscoScraper()),
+            *[_run_scraper(s) for s in scrapers.values()],
             return_exceptions=True,
         )
 
-        slugs = ["tienda_inglesa", "disco"]
+        slugs = list(scrapers.keys())
         scrapers_data: dict[str, list[ScrapedProduct] | BaseException] = dict(
             zip(slugs, scrape_results)
         )
@@ -203,7 +211,15 @@ async def _save_scraped_products(
     price_records: list[PriceHistory] = []
 
     # --- Productos con external_id (caso mayoritario) ---
-    with_id = [p for p in scraped if p.external_id]
+    # Deduplicar por external_id: un mismo producto puede aparecer en varias
+    # categorías del sitio; conservar solo la primera aparición evita
+    # UniqueViolationError al hacer flush dentro del mismo loop.
+    seen_ext_ids: set[str] = set()
+    with_id: list[ScrapedProduct] = []
+    for p in scraped:
+        if p.external_id and p.external_id not in seen_ext_ids:
+            seen_ext_ids.add(p.external_id)
+            with_id.append(p)
     without_id = [p for p in scraped if not p.external_id]
 
     existing_map: dict[str, SupermarketProduct] = {}
@@ -237,6 +253,7 @@ async def _save_scraped_products(
             # flush para obtener el ID antes de crear el registro de precio
             await session.flush()
             inserted += 1
+            existing_map[product.external_id] = sp  # evita duplicados en re-runs parciales
 
         price_records.append(
             PriceHistory(
@@ -340,4 +357,13 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         stream=sys.stdout,
     )
-    asyncio.run(run_all_scrapers())
+    # Uso: python -m app.scrapers.run [slug1 slug2 ...]
+    # Sin argumentos corre todos los scrapers.
+    # Ej: python -m app.scrapers.run tienda_inglesa
+    only_arg = sys.argv[1:] or None
+    if only_arg:
+        unknown = [s for s in only_arg if s not in _ALL_SCRAPERS]
+        if unknown:
+            print(f"Scrapers desconocidos: {unknown}. Disponibles: {list(_ALL_SCRAPERS)}")
+            sys.exit(1)
+    asyncio.run(run_all_scrapers(only=only_arg))
